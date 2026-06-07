@@ -41,7 +41,7 @@ The bot gives you the exact one-liner (with `CONTROL_URL` and a fresh `TOKEN`
 filled in). It looks like:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/quickserverhub/mc-spawn-agent/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/berolog/mc-spawn-quickserverhub/main/install.sh \
   | sudo CONTROL_URL=https://agent.quickserverhub.com TOKEN=<one-time-token> bash
 ```
 
