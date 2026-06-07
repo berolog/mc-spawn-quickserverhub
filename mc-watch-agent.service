@@ -1,0 +1,17 @@
+# Reference systemd unit (install.sh generates this with CONTROL_URL/TOKEN filled in).
+# Kept here for inspection; you don't install this file directly.
+[Unit]
+Description=mc-watch agent
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Environment=CONTROL_URL=https://agent.quickserverhub.com
+Environment=TOKEN=<one-time-enroll-token>
+Environment=AGENT_STATE=/etc/mc-watch-agent/cred.json
+ExecStart=/usr/bin/env python3 /opt/mc-watch-agent/agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

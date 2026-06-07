@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+.venv/
+# Never commit a real agent credential.
+cred.json

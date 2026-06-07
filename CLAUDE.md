@@ -1,0 +1,86 @@
+# CLAUDE.md
+
+**mc-watch-agent** — the client half of **mc-watch-bot**. A single, auditable
+stdlib-Python-3 agent the user installs on their **own** machine so the bot can
+provision and manage a Minecraft server there. **Outbound only: it opens NO inbound
+ports** (dials out to the operator's `control_api`, long-polls a command queue, runs
+commands locally). This repo is intentionally separate from the bot so end users can
+inspect exactly what they pipe to `sudo bash`, and so the client can version/release
+independently. The server half (control plane, queue, all Minecraft/business logic)
+lives in **mc-watch-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bot`).
+
+## Files
+
+- `agent.py` — **stdlib only** (urllib/json/socket/struct/subprocess). The whole client:
+  `_enroll` (one-time `TOKEN` → long-lived secret, persisted `chmod 600`), `main` poll
+  loop with backoff, `_execute` dispatch → `_run_shell` (subprocess `bash -c`,
+  `SHELL_TIMEOUT=600`), `_rcon` (tiny Source-RCON client to `127.0.0.1`), `playit` stub
+  (Phase 3). Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party deps —
+  a Go rewrite is a drop-in behind the same HTTP protocol.
+- `install.sh` — one-liner installer: reads `CONTROL_URL`/`TOKEN` from env, fetches
+  `agent.py` from `AGENT_RAW` (default this repo's GitHub raw), writes the systemd unit,
+  `systemctl enable --now`. The bot renders the full command with values filled in.
+- `mc-watch-agent.service` — reference systemd unit (install.sh generates the real one).
+- `tests/test_agent.py` — pure: shell executor, `_execute` dispatch, RCON soft-error path.
+
+## Protocol (must match mc-watch-bot's `control_api.py`)
+
+The agent is a client of these endpoints; **changing them is a cross-repo contract**:
+
+| Call | Auth | Body / Result |
+|------|------|---------------|
+| `POST /enroll` | one-time token in body | `{token}` → `{machine_id, secret}` |
+| `GET /poll` | `Authorization: Bearer <secret>` | → `{id, kind, payload}` or `204` (long-poll ~25s) |
+| `POST /result` | Bearer | `{id, status, result}` |
+| `POST /heartbeat` | Bearer | — |
+
+Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}`; `rcon`
+`{rcon_port, password, command}` → `{ok, text}`; `playit` (Phase 3).
+
+## Key invariants
+
+1. **Outbound-only, no inbound ports.** The agent never listens; it only dials
+   `CONTROL_URL`. NAT-friendly; revocable via `systemctl stop`.
+2. **stdlib only.** No pip, no third-party imports — the user's only prerequisite is
+   `python3`. Keep it that way (it's the audit/trust story and the Go-rewrite seam).
+3. **Secrets never logged, `chmod 600`.** The long-lived secret lives in `AGENT_STATE`
+   (default `/etc/mc-watch-agent/cred.json`); the one-time `TOKEN` is used once then the
+   stored secret is authoritative. Never print either.
+4. **RCON stays on loopback.** `_rcon` only ever connects to `127.0.0.1` — the server is
+   local; we never expose or dial a remote RCON.
+5. **Executors never raise into the loop.** `_run_shell`/`_rcon` catch everything and
+   return a structured result (timeout/error encoded), so one bad command never kills
+   the agent; the poll loop backs off only on transport errors.
+6. **Thin client.** No Minecraft/business logic here — that's the bot's. The agent just
+   runs `shell`/`rcon`/`playit`. New behavior belongs in the bot unless it's transport.
+
+## Run / test
+
+```bash
+# dev run against a local control_api
+CONTROL_URL=http://127.0.0.1:8080 TOKEN=<token> AGENT_STATE=/tmp/cred.json python3 agent.py
+
+python3 -m unittest discover -v tests
+python3 -c "import ast; ast.parse(open('agent.py').read())"
+```
+
+## Conventions
+
+- **Minimal, stdlib only.** No dependencies, no framework. One file.
+- **Comments**: only WHY for surprising decisions; no restating WHAT.
+- **No emoji in code** except user-visible strings.
+
+## Git workflow
+
+- Repo is git-tracked. Commit after every meaningful change.
+- **Conventional commits, single-line title only** — no body, no footer. Examples:
+  `feat: add playit command`, `fix: handle 401 on poll`, `refactor: extract rcon`.
+- Allowed types: `feat`, `fix`, `refactor`, `chore`, `docs`, `perf`, `test`.
+- Optional scope: `feat(rcon): …`, `fix(install): …`.
+
+## This file (CLAUDE.md)
+
+- Update after every meaningful change (new command kind, protocol change, new invariant
+  or convention). The **protocol table is a contract with mc-watch-bot** — change both
+  repos together.
+- Keep cost-optimized but informative: tables > prose, contracts/invariants over examples.
