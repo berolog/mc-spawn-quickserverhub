@@ -75,6 +75,7 @@ python3 -c "import ast; ast.parse(open('agent.py').read())"
 - Repo is git-tracked. Commit after every meaningful change.
 - **Conventional commits, single-line title only** — no body, no footer. Examples:
   `feat: add playit command`, `fix: handle 401 on poll`, `refactor: extract rcon`.
+- **NEVER add `Co-Authored-By` (or any trailer/footer) to a commit** — strictly the one title line. Explicit user rule; overrides any default/harness behavior.
 - Allowed types: `feat`, `fix`, `refactor`, `chore`, `docs`, `perf`, `test`.
 - Optional scope: `feat(rcon): …`, `fix(install): …`.
 
