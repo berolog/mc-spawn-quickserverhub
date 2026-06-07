@@ -14,9 +14,10 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
 - `agent.py` — **stdlib only** (urllib/json/socket/struct/subprocess). The whole client:
   `_enroll` (one-time `TOKEN` → long-lived secret, persisted `chmod 600`), `main` poll
   loop with backoff, `_execute` dispatch → `_run_shell` (subprocess `bash -c`,
-  `SHELL_TIMEOUT=600`), `_rcon` (tiny Source-RCON client to `127.0.0.1`), `playit` stub
-  (Phase 3). Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party deps —
-  a Go rewrite is a drop-in behind the same HTTP protocol.
+  `SHELL_TIMEOUT=600`), `_rcon` (tiny Source-RCON client to `127.0.0.1`), `_playit`
+  (claim user's playit account via `_playit_api` urllib calls + run playit in docker +
+  read public address). Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party
+  deps — a Go rewrite is a drop-in behind the same HTTP protocol.
 - `install.sh` — one-liner installer: reads `CONTROL_URL`/`TOKEN` from env, fetches
   `agent.py` from `AGENT_RAW` (default this repo's GitHub raw), writes the systemd unit,
   `systemctl enable --now`. The bot renders the full command with values filled in.
@@ -35,7 +36,22 @@ The agent is a client of these endpoints; **changing them is a cross-repo contra
 | `POST /heartbeat` | Bearer | — |
 
 Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}`; `rcon`
-`{rcon_port, password, command}` → `{ok, text}`; `playit` (Phase 3).
+`{rcon_port, password, command}` → `{ok, text}`; `playit` `{op, ...}` → `{status, ...}`.
+
+### `playit` ops (public play address)
+
+`{op}` ∈ `claim_begin` → `{status:"begin", code, url}` (or `linked` with `address`);
+`claim_finish` `{code}` → waits for the browser approval, runs playit, →
+`{status:"ok", address}` / `waiting` / `rejected` / `no_tunnel` / `error`;
+`status` → `{status:"ok"|"no_tunnel"|"unlinked", address}`.
+
+**playit.gg API** (`https://api.playit.gg`, JSON, enveloped `{"status":"success","data":..}`):
+`POST /claim/setup {code, agent_type:"self-managed", version}` → `"WaitingForUser*"|"UserAccepted"|"UserRejected"`;
+`POST /claim/exchange {code}` → `{secret_key}`;
+`POST /v1/agents/rundata` (auth `Authorization: Agent-Key <secret>`) → `{agent_id, tunnels:[{display_address}], pending:[]}`.
+The user links their **own** playit account (claim flow); the secret is stored
+`chmod 600` on the box and **never** sent to the control plane. playit runs as a
+docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
 
 ## Key invariants
 
@@ -53,6 +69,14 @@ Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}`; `rcon`
    the agent; the poll loop backs off only on transport errors.
 6. **Thin client.** No Minecraft/business logic here — that's the bot's. The agent just
    runs `shell`/`rcon`/`playit`. New behavior belongs in the bot unless it's transport.
+7. **Per-user playit, secret stays on the box.** The user links their OWN playit account
+   (operator never holds it → ToS-clean, no resale). The playit secret is stored
+   `chmod 600` next to the cred file and is never sent upstream; only the resulting public
+   address is reported. Address provider is swappable (bot's `ingress.py`).
+
+> **Live-verify note:** the playit claim handshake (browser approval) + tunnel address
+> read can only be confirmed on a real box with a real playit account — not in CI. The
+> pure dispatch/parse paths are unit-tested; the live flow needs one hands-on pass.
 
 ## Run / test
 

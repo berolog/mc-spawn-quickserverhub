@@ -27,7 +27,8 @@ agent (your box, OUTBOUND only) ──HTTPS──▶ control_api (operator)
 3. **Execute locally** —
    - `shell` — runs a script (the bot provisions Docker + `itzg/minecraft-server`);
    - `rcon` — speaks Source RCON to `127.0.0.1:<port>` (the server is local, no tunnel);
-   - `playit` — public play-address for friends (Phase 3, not implemented yet).
+   - `playit` — links the user's own playit.gg account (claim flow) and reports the
+     public address friends connect to — no inbound port opened on the box.
 4. **Report** — posts the result back to `CONTROL_URL/result`.
 
 The bot never connects *to* the agent; everything is the agent reaching out. All
