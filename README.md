@@ -1,12 +1,12 @@
-# mc-watch-agent
+# mc-spawn-agent
 
-The **client half** of [mc-watch-bot](https://gitlab.com/quickserverhub/applications/mc-hosting-bot)
+The **client half** of [mc-spawn-bot](https://gitlab.com/quickserverhub/applications/mc-hosting-bot)
 — a tiny, auditable agent you run on **your own machine** so the Telegram bot can
 spin up and manage a Minecraft server there.
 
 **Outbound only. It opens NO inbound ports.** The agent dials *out* to the bot's
 control endpoint, so it works behind NAT / a home router with nothing exposed and
-nothing to port-forward. Stop it any time with `systemctl stop mc-watch-agent`.
+nothing to port-forward. Stop it any time with `systemctl stop mc-spawn-agent`.
 
 > Single file, **standard-library Python 3 only** — no pip installs. Read
 > [`agent.py`](agent.py) before you run it; that's the whole client.
@@ -17,12 +17,12 @@ nothing to port-forward. Stop it any time with `systemctl stop mc-watch-agent`.
 agent (your box, OUTBOUND only) ──HTTPS──▶ control_api (operator)
    │  runs docker + local RCON                 │
    ▼                                           ▼
- 127.0.0.1:25565 / :25575                  Postgres command queue ◀── mc-watch-bot
+ 127.0.0.1:25565 / :25575                  Postgres command queue ◀── mc-spawn-bot
 ```
 
 1. **Enroll** — on first start the agent redeems a one-time `TOKEN` (issued by the
    bot) at `CONTROL_URL/enroll` and gets a long-lived secret, saved to
-   `/etc/mc-watch-agent/cred.json` (`chmod 600`).
+   `/etc/mc-spawn-agent/cred.json` (`chmod 600`).
 2. **Poll** — it long-polls `CONTROL_URL/poll` for commands (Bearer secret).
 3. **Execute locally** —
    - `shell` — runs a script (the bot provisions Docker + `itzg/minecraft-server`);
@@ -40,11 +40,11 @@ The bot gives you the exact one-liner (with `CONTROL_URL` and a fresh `TOKEN`
 filled in). It looks like:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/quickserverhub/mc-watch-agent/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/quickserverhub/mc-spawn-agent/main/install.sh \
   | sudo CONTROL_URL=https://agent.quickserverhub.com TOKEN=<one-time-token> bash
 ```
 
-This installs `agent.py` to `/opt/mc-watch-agent/`, writes a systemd unit, and
+This installs `agent.py` to `/opt/mc-spawn-agent/`, writes a systemd unit, and
 starts it. Requirement on the box: **`python3`** (Docker is installed by the bot's
 provision step when you create a server).
 
@@ -62,15 +62,15 @@ CONTROL_URL=http://127.0.0.1:8080 TOKEN=<token> AGENT_STATE=/tmp/cred.json pytho
 |-----|----------|---------|---------|
 | `CONTROL_URL` | yes | — | Operator control endpoint the agent dials out to. |
 | `TOKEN` | first run only | — | One-time enroll token from the bot (ignored once enrolled). |
-| `AGENT_STATE` | no | `/etc/mc-watch-agent/cred.json` | Where the long-lived secret is stored. |
+| `AGENT_STATE` | no | `/etc/mc-spawn-agent/cred.json` | Where the long-lived secret is stored. |
 
 ## Manage
 
 ```bash
-systemctl status  mc-watch-agent
-systemctl stop    mc-watch-agent      # pause: bot can no longer reach this box
-systemctl disable --now mc-watch-agent
-rm -rf /opt/mc-watch-agent /etc/mc-watch-agent   # full uninstall
+systemctl status  mc-spawn-agent
+systemctl stop    mc-spawn-agent      # pause: bot can no longer reach this box
+systemctl disable --now mc-spawn-agent
+rm -rf /opt/mc-spawn-agent /etc/mc-spawn-agent   # full uninstall
 ```
 
 ## Tests

@@ -1,13 +1,13 @@
 # CLAUDE.md
 
-**mc-watch-agent** — the client half of **mc-watch-bot**. A single, auditable
+**mc-spawn-agent** — the client half of **mc-spawn-bot**. A single, auditable
 stdlib-Python-3 agent the user installs on their **own** machine so the bot can
 provision and manage a Minecraft server there. **Outbound only: it opens NO inbound
 ports** (dials out to the operator's `control_api`, long-polls a command queue, runs
 commands locally). This repo is intentionally separate from the bot so end users can
 inspect exactly what they pipe to `sudo bash`, and so the client can version/release
 independently. The server half (control plane, queue, all Minecraft/business logic)
-lives in **mc-watch-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bot`).
+lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bot`).
 
 ## Files
 
@@ -20,10 +20,10 @@ lives in **mc-watch-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
 - `install.sh` — one-liner installer: reads `CONTROL_URL`/`TOKEN` from env, fetches
   `agent.py` from `AGENT_RAW` (default this repo's GitHub raw), writes the systemd unit,
   `systemctl enable --now`. The bot renders the full command with values filled in.
-- `mc-watch-agent.service` — reference systemd unit (install.sh generates the real one).
+- `mc-spawn-agent.service` — reference systemd unit (install.sh generates the real one).
 - `tests/test_agent.py` — pure: shell executor, `_execute` dispatch, RCON soft-error path.
 
-## Protocol (must match mc-watch-bot's `control_api.py`)
+## Protocol (must match mc-spawn-bot's `control_api.py`)
 
 The agent is a client of these endpoints; **changing them is a cross-repo contract**:
 
@@ -44,7 +44,7 @@ Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}`; `rcon`
 2. **stdlib only.** No pip, no third-party imports — the user's only prerequisite is
    `python3`. Keep it that way (it's the audit/trust story and the Go-rewrite seam).
 3. **Secrets never logged, `chmod 600`.** The long-lived secret lives in `AGENT_STATE`
-   (default `/etc/mc-watch-agent/cred.json`); the one-time `TOKEN` is used once then the
+   (default `/etc/mc-spawn-agent/cred.json`); the one-time `TOKEN` is used once then the
    stored secret is authoritative. Never print either.
 4. **RCON stays on loopback.** `_rcon` only ever connects to `127.0.0.1` — the server is
    local; we never expose or dial a remote RCON.
@@ -81,6 +81,6 @@ python3 -c "import ast; ast.parse(open('agent.py').read())"
 ## This file (CLAUDE.md)
 
 - Update after every meaningful change (new command kind, protocol change, new invariant
-  or convention). The **protocol table is a contract with mc-watch-bot** — change both
+  or convention). The **protocol table is a contract with mc-spawn-bot** — change both
   repos together.
 - Keep cost-optimized but informative: tables > prose, contracts/invariants over examples.

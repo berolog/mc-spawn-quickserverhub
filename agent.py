@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mc-watch agent — runs on the user's own machine. STDLIB ONLY (python3).
+"""mc-spawn agent — runs on the user's own machine. STDLIB ONLY (python3).
 
 Outbound only: it dials the control API (no inbound ports on this box), redeems a
 one-time enroll token for a long-lived secret, then long-polls for commands and
@@ -9,9 +9,9 @@ executes them locally:
   * playit — (Phase 3) bring up the public play address.
 
 Config via env: CONTROL_URL (required), TOKEN (one-time, first run only),
-AGENT_STATE (cred file, default /etc/mc-watch-agent/cred.json).
+AGENT_STATE (cred file, default /etc/mc-spawn-agent/cred.json).
 
-Thin by design: all Minecraft logic lives in the bot (mc-watch-bot) — the agent is
+Thin by design: all Minecraft logic lives in the bot (mc-spawn-bot) — the agent is
 a small, auditable executor. This is the client half of the system and lives in its
 own repository so users can inspect exactly what they install; a Go rewrite can be a
 drop-in (same HTTP protocol).
@@ -28,14 +28,14 @@ import urllib.request
 
 CONTROL_URL = os.environ.get("CONTROL_URL", "").rstrip("/")
 TOKEN = os.environ.get("TOKEN", "").strip()
-STATE_PATH = os.environ.get("AGENT_STATE", "/etc/mc-watch-agent/cred.json")
+STATE_PATH = os.environ.get("AGENT_STATE", "/etc/mc-spawn-agent/cred.json")
 
 POLL_TIMEOUT = 40        # > server long-poll (25s)
 SHELL_TIMEOUT = 600      # provisioning (docker pull) can be slow
 
 
 def _log(msg):
-    print(f"[mc-watch-agent] {msg}", flush=True)
+    print(f"[mc-spawn-agent] {msg}", flush=True)
 
 
 def _http(method, path, body=None, secret=None, timeout=POLL_TIMEOUT):

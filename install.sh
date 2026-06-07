@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# mc-watch agent installer. Run on YOUR OWN machine (the bot shows the full line):
-#   curl -fsSL https://raw.githubusercontent.com/quickserverhub/mc-watch-agent/main/install.sh \
+# mc-spawn agent installer. Run on YOUR OWN machine (the bot shows the full line):
+#   curl -fsSL https://raw.githubusercontent.com/quickserverhub/mc-spawn-agent/main/install.sh \
 #     | sudo CONTROL_URL=<control-url> TOKEN=<token> bash
 #
 # Outbound only — opens NO inbound ports. Installs a tiny python3 agent as a
 # systemd service. Inspect this script and agent.py before running (open source:
-# https://github.com/quickserverhub/mc-watch-agent).
+# https://github.com/quickserverhub/mc-spawn-agent).
 set -euo pipefail
 
 CONTROL_URL="${CONTROL_URL:-}"
 TOKEN="${TOKEN:-}"
 # Where to fetch agent.py from (override for forks / pinned commits).
-AGENT_RAW="${AGENT_RAW:-https://raw.githubusercontent.com/quickserverhub/mc-watch-agent/main}"
-DIR=/opt/mc-watch-agent
-STATE=/etc/mc-watch-agent
+AGENT_RAW="${AGENT_RAW:-https://raw.githubusercontent.com/quickserverhub/mc-spawn-agent/main}"
+DIR=/opt/mc-spawn-agent
+STATE=/etc/mc-spawn-agent
 
 if [ -z "$CONTROL_URL" ]; then echo "CONTROL_URL env is required" >&2; exit 1; fi
 if [ -z "$TOKEN" ]; then echo "TOKEN env is required" >&2; exit 1; fi
@@ -28,9 +28,9 @@ else
 fi
 chmod 0644 "$DIR/agent.py"
 
-cat > /etc/systemd/system/mc-watch-agent.service <<EOF
+cat > /etc/systemd/system/mc-spawn-agent.service <<EOF
 [Unit]
-Description=mc-watch agent
+Description=mc-spawn agent
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -47,5 +47,5 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now mc-watch-agent.service
-echo "mc-watch agent installed and started. Управление — в Telegram-боте."
+systemctl enable --now mc-spawn-agent.service
+echo "mc-spawn agent installed and started. Управление — в Telegram-боте."
