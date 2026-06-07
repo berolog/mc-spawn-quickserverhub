@@ -33,6 +33,10 @@ STATE_PATH = os.environ.get("AGENT_STATE", "/etc/mc-spawn-agent/cred.json")
 
 POLL_TIMEOUT = 40        # > server long-poll (25s)
 SHELL_TIMEOUT = 600      # provisioning (docker pull) can be slow
+# urllib's default "Python-urllib/x.y" UA is on Cloudflare's Browser Integrity
+# Check banlist (HTTP 403, error 1010) — the control plane sits behind a proxied
+# Cloudflare hostname, so send a real product UA or enroll/poll never get through.
+USER_AGENT = "mc-spawn-agent/1.0"
 
 
 def _log(msg):
@@ -42,6 +46,7 @@ def _log(msg):
 def _http(method, path, body=None, secret=None, timeout=POLL_TIMEOUT):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(CONTROL_URL + path, data=data, method=method)
+    req.add_header("User-Agent", USER_AGENT)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     if secret:
@@ -167,6 +172,7 @@ def _playit_api(path, body, secret=None):
     transport/HTTP error or a non-success envelope."""
     data = json.dumps(body).encode()
     req = urllib.request.Request(PLAYIT_API + path, data=data, method="POST")
+    req.add_header("User-Agent", USER_AGENT)
     req.add_header("Content-Type", "application/json")
     if secret:
         req.add_header("Authorization", "Agent-Key " + secret)

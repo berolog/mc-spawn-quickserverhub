@@ -59,6 +59,10 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
    `CONTROL_URL`. NAT-friendly; revocable via `systemctl stop`.
 2. **stdlib only.** No pip, no third-party imports — the user's only prerequisite is
    `python3`. Keep it that way (it's the audit/trust story and the Go-rewrite seam).
+   Every request sets a real `User-Agent` (`USER_AGENT`) — urllib's default
+   `Python-urllib/x.y` is on Cloudflare's Browser Integrity Check banlist (HTTP 403,
+   error 1010), and `CONTROL_URL` sits behind a proxied Cloudflare hostname, so the
+   default UA makes enroll/poll silently fail at the edge. Never revert to no UA.
 3. **Secrets never logged, `chmod 600`.** The long-lived secret lives in `AGENT_STATE`
    (default `/etc/mc-spawn-agent/cred.json`); the one-time `TOKEN` is used once then the
    stored secret is authoritative. Never print either.
