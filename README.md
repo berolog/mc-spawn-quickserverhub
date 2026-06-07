@@ -6,7 +6,8 @@ spin up and manage a Minecraft server there.
 
 **Outbound only. It opens NO inbound ports.** The agent dials *out* to the bot's
 control endpoint, so it works behind NAT / a home router with nothing exposed and
-nothing to port-forward. Stop it any time with `systemctl stop mc-spawn-agent`.
+nothing to port-forward. Stop it any time (`systemctl stop mc-spawn-agent`, or
+`systemctl --user stop …` / `rc-service mc-spawn-agent stop` depending on backend).
 
 > Single file, **standard-library Python 3 only** — no pip installs. Read
 > [`agent.py`](agent.py) before you run it; that's the whole client.
@@ -42,14 +43,30 @@ filled in). It looks like:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/berolog/mc-spawn-quickserverhub/main/install.sh \
-  | sudo CONTROL_URL=https://agent.quickserverhub.com TOKEN=<one-time-token> bash
+  | CONTROL_URL=https://agent.quickserverhub.com TOKEN=<one-time-token> sh
 ```
 
-This installs `agent.py` to `/opt/mc-spawn-agent/`, writes a systemd unit, and
-starts it. Requirement on the box: **`python3`** (Docker is installed by the bot's
-provision step when you create a server).
+The installer is **portable** (Ubuntu/Debian, Arch, Alpine, Fedora/RHEL,
+openSUSE — `apt`/`dnf`/`yum`/`pacman`/`apk`/`zypper`) and **self-bootstrapping**:
+it installs whatever is missing (`python3`, `bash`, `docker`) using your distro's
+package manager, fetches `agent.py`, and registers a service via whatever init
+exists:
 
-Override `AGENT_RAW` to install from a fork or a pinned commit.
+| You run as | Backend chosen |
+|------------|----------------|
+| root + systemd | systemd **system** service |
+| root + OpenRC (Alpine) | OpenRC service (`/etc/init.d`) |
+| non-root + systemd | systemd **--user** service (lingering enabled via sudo if available) |
+| anything else | `nohup` launcher + `@reboot` crontab |
+
+**No forced `sudo`.** It escalates only when a missing package actually needs
+root — so on a box that already has the prerequisites, a normal user installs
+**rootless** (into `~/.local/share` + `~/.config`). Note: provisioning a server
+needs Docker, which usually needs root or `docker`-group membership; the installer
+sets this up when it can and warns otherwise.
+
+Override `AGENT_RAW` to install from a fork or a pinned commit. Pipe to `bash`
+instead of `sh` if you prefer — the script is POSIX `sh` either way.
 
 ### Manual run (dev)
 
@@ -63,9 +80,12 @@ CONTROL_URL=http://127.0.0.1:8080 TOKEN=<token> AGENT_STATE=/tmp/cred.json pytho
 |-----|----------|---------|---------|
 | `CONTROL_URL` | yes | — | Operator control endpoint the agent dials out to. |
 | `TOKEN` | first run only | — | One-time enroll token from the bot (ignored once enrolled). |
-| `AGENT_STATE` | no | `/etc/mc-spawn-agent/cred.json` | Where the long-lived secret is stored. |
+| `AGENT_STATE` | no | `/etc/mc-spawn-agent/cred.json` (root) or `~/.config/mc-spawn-agent/cred.json` (rootless) | Where the long-lived secret is stored. |
+| `AGENT_RAW` | no | this repo's GitHub raw | Base URL `agent.py` is fetched from (forks / pinned commits). |
 
 ## Manage
+
+Depends on the backend the installer picked (it prints which). Root systemd:
 
 ```bash
 systemctl status  mc-spawn-agent
@@ -73,6 +93,12 @@ systemctl stop    mc-spawn-agent      # pause: bot can no longer reach this box
 systemctl disable --now mc-spawn-agent
 rm -rf /opt/mc-spawn-agent /etc/mc-spawn-agent   # full uninstall
 ```
+
+Rootless systemd `--user`: same commands with `--user`; state lives in
+`~/.local/share/mc-spawn-agent` + `~/.config/mc-spawn-agent`. Alpine/OpenRC:
+`rc-service mc-spawn-agent {status,stop}`, `rc-update del mc-spawn-agent`. Nohup
+fallback: `kill "$(cat ~/.config/mc-spawn-agent/agent.pid)"` and remove the
+`@reboot` crontab line.
 
 ## Tests
 

@@ -1,15 +1,18 @@
-# Reference systemd unit (install.sh generates this with CONTROL_URL/TOKEN filled in).
+# Reference systemd unit (install.sh generates the real one per backend).
 # Kept here for inspection; you don't install this file directly.
+#
+# install.sh writes either a system unit (root), a --user unit (rootless), an
+# OpenRC script (Alpine), or a nohup launcher — all of them exec $DIR/run.sh,
+# a 0600 launcher that exports CONTROL_URL/TOKEN/AGENT_STATE (so secrets stay
+# out of the world-readable unit file and out of `ps`).
 [Unit]
 Description=mc-spawn agent
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
-Environment=CONTROL_URL=https://agent.quickserverhub.com
-Environment=TOKEN=<one-time-enroll-token>
-Environment=AGENT_STATE=/etc/mc-spawn-agent/cred.json
-ExecStart=/usr/bin/env python3 /opt/mc-spawn-agent/agent.py
+# run.sh exports CONTROL_URL / TOKEN / AGENT_STATE, then execs python3 agent.py.
+ExecStart=/opt/mc-spawn-agent/run.sh
 Restart=always
 RestartSec=5
 

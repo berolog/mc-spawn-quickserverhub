@@ -18,10 +18,18 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   (claim user's playit account via `_playit_api` urllib calls + run playit in docker +
   read public address). Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party
   deps — a Go rewrite is a drop-in behind the same HTTP protocol.
-- `install.sh` — one-liner installer: reads `CONTROL_URL`/`TOKEN` from env, fetches
-  `agent.py` from `AGENT_RAW` (default this repo's GitHub raw), writes the systemd unit,
-  `systemctl enable --now`. The bot renders the full command with values filled in.
-- `mc-spawn-agent.service` — reference systemd unit (install.sh generates the real one).
+- `install.sh` — **portable POSIX-`sh`** one-liner installer (runs under Alpine's
+  busybox ash, not just bash). Reads `CONTROL_URL`/`TOKEN` from env, **detects the
+  distro package manager** (apt/dnf/yum/pacman/apk/zypper) and installs whatever is
+  missing (`python3`, `bash`, `docker`), fetches `agent.py` from `AGENT_RAW`, writes
+  a 0600 `run.sh` launcher (carries the env so secrets stay out of unit files/`ps`),
+  and registers a service via the available init: **systemd system** (root), **OpenRC**
+  (root, Alpine), **systemd --user** (rootless), else a **nohup + `@reboot` crontab**
+  fallback. Escalates with `sudo` ONLY when a missing package needs root — present
+  prereqs ⇒ a normal user installs rootless into `~/.local`+`~/.config`. The bot
+  renders the full command (no forced `sudo`, piped to `sh`).
+- `mc-spawn-agent.service` — reference systemd unit (install.sh generates the real
+  one per backend; all exec `run.sh`).
 - `tests/test_agent.py` — pure: shell executor, `_execute` dispatch, RCON soft-error path.
 
 ## Protocol (must match mc-spawn-bot's `control_api.py`)
@@ -57,8 +65,9 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
 
 1. **Outbound-only, no inbound ports.** The agent never listens; it only dials
    `CONTROL_URL`. NAT-friendly; revocable via `systemctl stop`.
-2. **stdlib only.** No pip, no third-party imports — the user's only prerequisite is
-   `python3`. Keep it that way (it's the audit/trust story and the Go-rewrite seam).
+2. **stdlib only.** No pip, no third-party imports — the agent's only runtime deps are
+   `python3` + `bash` (it shells out via `bash -c`), both auto-installed by `install.sh`.
+   Keep it that way (it's the audit/trust story and the Go-rewrite seam).
    Every request sets a real `User-Agent` (`USER_AGENT`) — urllib's default
    `Python-urllib/x.y` is on Cloudflare's Browser Integrity Check banlist (HTTP 403,
    error 1010), and `CONTROL_URL` sits behind a proxied Cloudflare hostname, so the
