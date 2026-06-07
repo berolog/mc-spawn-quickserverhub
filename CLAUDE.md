@@ -44,19 +44,24 @@ The agent is a client of these endpoints; **changing them is a cross-repo contra
 | `POST /heartbeat` | Bearer | — |
 
 Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}`; `rcon`
-`{rcon_port, password, command}` → `{ok, text}`; `playit` `{op, ...}` → `{status, ...}`.
+`{rcon_port, password, command}` → `{ok, text}`; `playit` `{op, local_port, ...}` → `{status, ...}`.
 
 ### `playit` ops (public play address)
 
-`{op}` ∈ `claim_begin` → `{status:"begin", code, url}` (or `linked` with `address`);
-`claim_finish` `{code}` → waits for the browser approval, runs playit, →
+All ops take `{local_port}` (the box-local Minecraft port) so the agent can
+**auto-create the tunnel** — the user never touches playit's (English) dashboard.
+`{op}` ∈ `claim_begin` `{local_port}` → `{status:"begin", code, url}` (or `linked`
+with `address`); `claim_finish` `{code, local_port}` → waits for the browser
+approval, runs playit, **auto-creates a Minecraft-Java tunnel if none exists**, →
 `{status:"ok", address}` / `waiting` / `rejected` / `no_tunnel` / `error`;
-`status` → `{status:"ok"|"no_tunnel"|"unlinked", address}`.
+`status` `{local_port}` → re-reads (auto-creating if linked-but-tunnel-less) →
+`{status:"ok"|"no_tunnel"|"unlinked"|"error", address}`.
 
 **playit.gg API** (`https://api.playit.gg`, JSON, enveloped `{"status":"success","data":..}`):
 `POST /claim/setup {code, agent_type:"self-managed", version}` → `"WaitingForUser*"|"UserAccepted"|"UserRejected"`;
 `POST /claim/exchange {code}` → `{secret_key}`;
-`POST /v1/agents/rundata` (auth `Authorization: Agent-Key <secret>`) → `{agent_id, tunnels:[{display_address}], pending:[]}`.
+`POST /v1/agents/rundata` (auth `Authorization: Agent-Key <secret>`) → `{agent_id, tunnels:[{display_address}], pending:[]}`;
+`POST /tunnels/create` (same Agent-Key auth) `{name, tunnel_type:"minecraft-java", port_type:"tcp", port_count:1, origin:{type:"agent", data:{agent_id, local_ip:"127.0.0.1", local_port}}, enabled:true, alloc:null, firewall_id:null, proxy_protocol:null}` → `{id}` (errors are bare enum strings, e.g. `"RequiresVerifiedAccount"`). Wire format verified against playit-agent's `api_client` crate.
 The user links their **own** playit account (claim flow); the secret is stored
 `chmod 600` on the box and **never** sent to the control plane. playit runs as a
 docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
@@ -86,6 +91,11 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
    (operator never holds it → ToS-clean, no resale). The playit secret is stored
    `chmod 600` next to the cred file and is never sent upstream; only the resulting public
    address is reported. Address provider is swappable (bot's `ingress.py`).
+8. **Tunnel is auto-created — no manual dashboard step.** After linking, the agent itself
+   POSTs `/tunnels/create` (Minecraft-Java → `127.0.0.1:<local_port>`) if the account has
+   no tunnel, so the user's only playit interaction is the one-click claim approval. The
+   single unavoidable English screen is that claim page (playit's domain — not translatable).
+   `_playit_run` never raises (docker may be absent ⇒ returns False), keeping invariant 5.
 
 > **Live-verify note:** the playit claim handshake (browser approval) + tunnel address
 > read can only be confirmed on a real box with a real playit account — not in CI. The

@@ -81,6 +81,47 @@ class PlayitTests(unittest.TestCase):
         self.assertEqual(res["status"], "no_tunnel")
         self.assertEqual(res["pending"], ["mc"])
 
+    def test_status_auto_creates_tunnel_when_none(self):
+        """Linked but tunnel-less ⇒ the agent POSTs /tunnels/create itself (no manual
+        dashboard step), then reads back the new address."""
+        agent._playit_secret = lambda: "sek"
+        calls = []
+        state = {"created": False}
+
+        def fake_api(path, body, secret=None):
+            calls.append((path, body))
+            if path == "/v1/agents/rundata":
+                tunnels = [{"display_address": "new.ply.gg:25"}] if state["created"] else []
+                return True, {"agent_id": "aid", "tunnels": tunnels, "pending": []}
+            if path == "/tunnels/create":
+                state["created"] = True
+                return True, {"id": "tid"}
+            return False, None
+
+        agent._playit_api = fake_api
+        res = agent._playit({"op": "status", "local_port": 25571})
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["address"], "new.ply.gg:25")
+        create = [b for p, b in calls if p == "/tunnels/create"][0]
+        self.assertEqual(create["tunnel_type"], "minecraft-java")
+        self.assertEqual(create["origin"]["data"]["agent_id"], "aid")
+        self.assertEqual(create["origin"]["data"]["local_port"], 25571)
+
+    def test_create_tunnel_failure_surfaces_error(self):
+        agent._playit_secret = lambda: "sek"
+
+        def fake_api(path, body, secret=None):
+            if path == "/v1/agents/rundata":
+                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
+            if path == "/tunnels/create":
+                return False, "RequiresVerifiedAccount"
+            return False, None
+
+        agent._playit_api = fake_api
+        res = agent._playit({"op": "status", "local_port": 25565})
+        self.assertEqual(res["status"], "error")
+        self.assertIn("RequiresVerifiedAccount", res["error"])
+
 
 class RconErrorPathTests(unittest.TestCase):
     def test_rcon_unreachable_is_soft_error(self):
