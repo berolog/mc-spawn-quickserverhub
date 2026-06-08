@@ -139,21 +139,27 @@ class PlayitTests(unittest.TestCase):
         self.assertEqual(res["status"], "ok")
         self.assertEqual(res["address"], "b.ply.gg:2")  # the matching port, not just the first
 
-    def test_status_no_tunnel_right_after_create(self):
+    def test_status_is_read_only_never_creates(self):
+        # status must NOT create tunnels — otherwise the bot's poll loop spawns duplicates.
         agent._playit_secret = lambda: "sek"
+        calls = []
 
         def fake_api(path, body, secret=None):
+            calls.append(path)
             if path == "/v1/agents/rundata":
                 return True, {"agent_id": "a", "tunnels": [], "pending": []}
-            if path == "/tunnels/create":
-                return True, {"id": "t"}
             return False, None
 
-        agent._playit_api = fake_api  # created but address not yet present
-        self.assertEqual(agent._playit({"op": "status", "local_port": 25565})["status"], "no_tunnel")
+        agent._playit_api = fake_api
+        res = agent._playit({"op": "status", "local_port": 25565})
+        self.assertEqual(res["status"], "no_tunnel")
+        self.assertNotIn("/tunnels/create", calls)  # the bug fix: no creation on status
 
     def test_create_tunnel_failure_surfaces_error(self):
+        # Real create failures (e.g. guest account) surface via playit_start, which is the
+        # only op that creates; status is read-only.
         agent._playit_secret = lambda: "sek"
+        agent._playit_run = lambda secret: True
 
         def fake_api(path, body, secret=None):
             if path == "/v1/agents/rundata":
@@ -163,15 +169,16 @@ class PlayitTests(unittest.TestCase):
             return False, None
 
         agent._playit_api = fake_api
-        res = agent._playit({"op": "status", "local_port": 25565})
+        res = agent._playit({"op": "playit_start", "local_port": 25565})
         self.assertEqual(res["status"], "error")
         self.assertIn("RequiresVerifiedAccount", res["error"])
 
     def test_agent_version_too_old_is_transient_not_fatal(self):
         # While the playit container is still connecting, create can return
-        # AgentVersionTooOld — the agent treats it as "pending" (no_tunnel) so the bot
-        # keeps polling and retries, instead of surfacing a hard error.
+        # AgentVersionTooOld — playit_start treats it as pending (not a hard error), so the
+        # bot keeps polling and the create is retried once the agent has connected.
         agent._playit_secret = lambda: "sek"
+        agent._playit_run = lambda secret: True
 
         def fake_api(path, body, secret=None):
             if path == "/v1/agents/rundata":
@@ -181,7 +188,7 @@ class PlayitTests(unittest.TestCase):
             return False, None
 
         agent._playit_api = fake_api
-        self.assertEqual(agent._playit({"op": "status", "local_port": 25565})["status"], "no_tunnel")
+        self.assertEqual(agent._playit({"op": "playit_start", "local_port": 25565})["status"], "ok")
 
     def test_create_tunnel_named_and_routed_per_port(self):
         captured = {}

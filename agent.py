@@ -425,9 +425,11 @@ def _playit(payload):
     if op == "status":
         if not secret:
             return {"status": "unlinked"}
-        addr, _pending, cerr = _playit_ensure_tunnel(secret, local_port)
-        if cerr:
-            return {"status": "error", "error": cerr}
+        # READ-ONLY: never create a tunnel here. Creation happens exactly once in
+        # `playit_start`; if `status` also created, the bot's address-poll loop would spawn
+        # a DUPLICATE tunnel on every tick until the first one becomes visible in rundata
+        # (the "two tunnels" bug).
+        addr, _pending = _playit_address(secret, local_port)
         return {"status": "ok" if addr else "no_tunnel", "address": addr}
     return {"status": "error", "error": f"unknown playit op {op}"}
 
