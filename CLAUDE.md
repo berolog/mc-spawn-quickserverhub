@@ -58,8 +58,9 @@ dashboard). The ops are deliberately **small and quick** — the bot loops `clai
 minutes. `{op}` ∈
 - `claim_begin` `{local_port}` → `{status:"begin", code, url}` (mint claim code) or `{status:"linked"}` (already linked).
 - `claim_poll` `{code}` → one quick approval check; on accept it exchanges + saves the secret → `{status:"accepted"|"rejected"}` or `{status:"waiting", stage:"visit"|"approve"}` (`visit` = link not opened yet; `approve` = opened, the Add/Next/Allow click still pending — the bot shows the matching hint).
-- `playit_start` `{local_port}` → run playit (docker) + ensure THIS port's tunnel (**the only creator** of tunnels); returns fast `{status:"ok"|"unlinked"|"error"}` (no address wait).
-- `status` `{local_port}` → **READ-ONLY** read of this port's address (never creates — else the bot's poll loop would spawn duplicate tunnels) → `{status:"ok", address}` / `no_tunnel` / `unlinked`.
+- `playit_start` `{local_port}` → just ensure the playit **container** is running (may pull the image first run) → `{status:"ok"|"unlinked"|"error"}`. Does NOT touch tunnels.
+- `ensure_tunnel` `{local_port}` → ONE create-or-detect attempt for this port's tunnel (the bot loops it): `{status:"created"|"exists"(+address?)|"connecting"|"error"|"unlinked"}`. Idempotent — never creates if the port already has a tunnel (in `tunnels` or `pending`). `connecting` = not ready yet (playit unreachable / no `agent_id` / transient `AgentVersionTooOld` while the container connects) → the bot retries; so the first create failing is normal and self-heals (no manual "try again").
+- `status` `{local_port}` → **READ-ONLY** read of this port's address (never creates) → `{status:"ok", address}` / `no_tunnel` / `unlinked`.
 - `remove_tunnel` `{local_port}` → delete just this port's tunnel → `{status:"ok"}` (one of several servers deleted; playit keeps running for the rest).
 - `teardown` `{}` → delete ALL our tunnels, stop+remove the playit container, drop the secret → `{status:"ok"}` (last server / whole machine deleted). Both delete ops are best-effort, idempotent, and touch only tunnels we created.
 
@@ -105,13 +106,15 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
    (operator never holds it → ToS-clean, no resale). The playit secret is stored
    `chmod 600` next to the cred file and is never sent upstream; only the resulting public
    address is reported. Address provider is swappable (bot's `ingress.py`).
-8. **Per-port tunnels, created exactly once.** Each server's tunnel is named
-   `mc-spawn-<local_port>` and routed to `127.0.0.1:<local_port>`, so multiple servers on
-   one box each get their own address (no shared-tunnel collision). **Only `playit_start`
-   creates** (`POST /tunnels/create` when this port has none); `status` is read-only — this
-   split prevents the address-poll loop from spawning duplicate tunnels. The dedup matches
-   tunnels by name in both `tunnels` and `pending` (rundata `AgentTunnelV1`/`...PendingV1`
-   both carry `name`). `_playit_run` never raises (docker may be absent ⇒ returns False).
+8. **Per-port tunnels; create is retried but never duplicated.** Each server's tunnel is
+   named `mc-spawn-<local_port>` and routed to `127.0.0.1:<local_port>`, so multiple servers
+   on one box each get their own address (no shared-tunnel collision). **Only `ensure_tunnel`
+   creates**, and only when the port has no tunnel yet (dedup matches by name in both
+   `tunnels` and `pending` — rundata `AgentTunnelV1`/`...PendingV1` both carry `name`). The
+   bot loops `ensure_tunnel` until `created`/`exists` (the first `POST /tunnels/create` often
+   fails `AgentVersionTooOld`/`connecting` while the container connects — that's retryable, not
+   fatal), then switches to read-only `status` for the address — so the create is robust AND
+   can't spawn duplicates. `_playit_run` never raises (docker may be absent ⇒ returns False).
 9. **Cleanup of tunnels, but the agent record can't be API-deleted.** `remove_tunnel
    {local_port}` deletes one server's tunnel; `teardown` deletes ALL of ours + stops the
    container + drops the secret. Both filter to tunnels WE created (name `mc-spawn` or

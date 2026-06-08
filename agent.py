@@ -281,32 +281,6 @@ def _playit_create_tunnel(secret, agent_id, local_port):
     return False, err
 
 
-def _playit_ensure_tunnel(secret, local_port):
-    """Ensure THIS port has its own tunnel; auto-create one (named per the port) if it
-    doesn't. Returns (address_or_None, pending_bool, error_or_None). A freshly created
-    tunnel has no address yet — the caller polls _playit_address for it."""
-    data = _playit_rundata(secret)
-    if data is None:
-        return None, False, "playit недоступен"
-    addr, pending = _port_address(data, local_port)
-    if addr or pending:
-        return addr, pending, None  # this port already has/awaits its tunnel
-    if not local_port:
-        return None, False, None  # nothing to create against
-    agent_id = data.get("agent_id")
-    if not agent_id:
-        return None, False, "no agent_id"
-    ok, err = _playit_create_tunnel(secret, agent_id, local_port)
-    if not ok:
-        if err == "AgentVersionTooOld":
-            # The playit container hasn't reported its version to the backend yet — this is
-            # transient. Report "pending" so the bot keeps polling and retries create next
-            # tick (by which point the agent has connected and the version is accepted).
-            return None, True, None
-        return None, False, err or "не удалось создать туннель"
-    return None, False, None  # created; address appears within seconds
-
-
 def _playit_delete_tunnels(secret, local_port=None):
     """Delete the tunnels WE created. With `local_port`, only that one server's tunnel;
     otherwise all of ours (machine teardown). Best-effort; never raises. Only touches
@@ -413,22 +387,47 @@ def _playit(payload):
         _save_playit_secret(data["secret_key"])
         return {"status": "accepted"}
     if op == "playit_start":
-        secret = _playit_secret()  # may have just been saved by claim_poll
+        # Just ensure the playit container is running. Tunnel creation is a SEPARATE,
+        # retryable op (`ensure_tunnel`) the bot loops — because on first run the container
+        # must connect to playit before `/tunnels/create` is accepted (otherwise the very
+        # first create fails and, with a read-only status poll, would never be retried).
+        secret = _playit_secret()
         if not secret:
             return {"status": "unlinked"}
         if not _playit_run(secret):
             return {"status": "error", "error": "не удалось запустить playit (docker)"}
-        _addr, _pending, cerr = _playit_ensure_tunnel(secret, local_port)
-        if cerr:
-            return {"status": "error", "error": cerr}
-        return {"status": "ok"}  # tunnel ensured; bot polls `status` for the address
+        return {"status": "ok"}
+    if op == "ensure_tunnel":
+        # ONE create-or-detect attempt (fast; the bot loops it). Idempotent: never creates
+        # if this port already has a tunnel. `connecting` ⇒ "retry later" (playit API/agent
+        # not ready yet, incl. the transient AgentVersionTooOld while the container connects);
+        # the bot keeps looping until `created`/`exists`, so creation isn't a one-shot.
+        if not secret:
+            return {"status": "unlinked"}
+        data = _playit_rundata(secret)
+        if data is None:
+            return {"status": "connecting"}
+        addr, pending = _port_address(data, local_port)
+        if addr:
+            return {"status": "exists", "address": addr}
+        if pending:
+            return {"status": "exists"}
+        agent_id = data.get("agent_id")
+        if not agent_id:
+            return {"status": "connecting"}
+        if not local_port:
+            return {"status": "error", "error": "no local_port"}
+        ok, err = _playit_create_tunnel(secret, agent_id, local_port)
+        if ok:
+            return {"status": "created"}
+        if err == "AgentVersionTooOld":
+            return {"status": "connecting"}
+        return {"status": "error", "error": err or "не удалось создать туннель"}
     if op == "status":
         if not secret:
             return {"status": "unlinked"}
-        # READ-ONLY: never create a tunnel here. Creation happens exactly once in
-        # `playit_start`; if `status` also created, the bot's address-poll loop would spawn
-        # a DUPLICATE tunnel on every tick until the first one becomes visible in rundata
-        # (the "two tunnels" bug).
+        # READ-ONLY: never creates (creation is ensure_tunnel's job). Just reports this
+        # port's address once its tunnel has one.
         addr, _pending = _playit_address(secret, local_port)
         return {"status": "ok" if addr else "no_tunnel", "address": addr}
     return {"status": "error", "error": f"unknown playit op {op}"}

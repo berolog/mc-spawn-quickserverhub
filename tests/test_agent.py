@@ -106,9 +106,21 @@ class PlayitTests(unittest.TestCase):
         self.assertTrue(captured["version"].startswith("playit "))
         self.assertEqual(captured["agent_type"], "self-managed")
 
-    def test_playit_start_ensures_tunnel_fast(self):
+    def test_playit_start_only_runs_docker_no_tunnel(self):
+        # playit_start just ensures the container; it must NOT create a tunnel (that's
+        # ensure_tunnel's retryable job).
         agent._playit_secret = lambda: "sek"
-        agent._playit_run = lambda secret: True
+        ran = {}
+        agent._playit_run = lambda secret: ran.setdefault("ran", True) or True
+        calls = []
+        agent._playit_api = lambda path, body, secret=None: (calls.append(path), (False, None))[1]
+        res = agent._playit({"op": "playit_start", "local_port": 25570})
+        self.assertEqual(res["status"], "ok")
+        self.assertTrue(ran.get("ran"))
+        self.assertNotIn("/tunnels/create", calls)
+
+    def test_ensure_tunnel_creates_when_absent(self):
+        agent._playit_secret = lambda: "sek"
         calls = []
 
         def fake_api(path, body, secret=None):
@@ -120,9 +132,27 @@ class PlayitTests(unittest.TestCase):
             return False, None
 
         agent._playit_api = fake_api
-        res = agent._playit({"op": "playit_start", "local_port": 25570})
-        self.assertEqual(res["status"], "ok")  # returns once the tunnel is ensured
-        self.assertIn("/tunnels/create", calls)  # no address-wait loop here
+        res = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
+        self.assertEqual(res["status"], "created")
+        self.assertIn("/tunnels/create", calls)
+
+    def test_ensure_tunnel_idempotent_when_present(self):
+        # If this port already has a tunnel, ensure must NOT create another (no duplicates).
+        agent._playit_secret = lambda: "sek"
+        calls = []
+
+        def fake_api(path, body, secret=None):
+            calls.append(path)
+            if path == "/v1/agents/rundata":
+                return True, {"agent_id": "aid", "pending": [],
+                              "tunnels": [{"name": "mc-spawn-25570", "display_address": "x.ply.gg:1"}]}
+            return False, None
+
+        agent._playit_api = fake_api
+        res = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
+        self.assertEqual(res["status"], "exists")
+        self.assertEqual(res["address"], "x.ply.gg:1")
+        self.assertNotIn("/tunnels/create", calls)
 
     def test_status_unlinked(self):
         agent._playit_secret = lambda: None
@@ -155,11 +185,9 @@ class PlayitTests(unittest.TestCase):
         self.assertEqual(res["status"], "no_tunnel")
         self.assertNotIn("/tunnels/create", calls)  # the bug fix: no creation on status
 
-    def test_create_tunnel_failure_surfaces_error(self):
-        # Real create failures (e.g. guest account) surface via playit_start, which is the
-        # only op that creates; status is read-only.
+    def test_ensure_tunnel_hard_error_surfaces(self):
+        # Real create failures (e.g. guest account) surface via ensure_tunnel as an error.
         agent._playit_secret = lambda: "sek"
-        agent._playit_run = lambda secret: True
 
         def fake_api(path, body, secret=None):
             if path == "/v1/agents/rundata":
@@ -169,16 +197,14 @@ class PlayitTests(unittest.TestCase):
             return False, None
 
         agent._playit_api = fake_api
-        res = agent._playit({"op": "playit_start", "local_port": 25565})
+        res = agent._playit({"op": "ensure_tunnel", "local_port": 25565})
         self.assertEqual(res["status"], "error")
         self.assertIn("RequiresVerifiedAccount", res["error"])
 
-    def test_agent_version_too_old_is_transient_not_fatal(self):
-        # While the playit container is still connecting, create can return
-        # AgentVersionTooOld — playit_start treats it as pending (not a hard error), so the
-        # bot keeps polling and the create is retried once the agent has connected.
+    def test_ensure_tunnel_version_too_old_is_connecting_retryable(self):
+        # While the container is still connecting, create returns AgentVersionTooOld —
+        # ensure_tunnel reports "connecting" (not error) so the bot keeps retrying create.
         agent._playit_secret = lambda: "sek"
-        agent._playit_run = lambda secret: True
 
         def fake_api(path, body, secret=None):
             if path == "/v1/agents/rundata":
@@ -188,7 +214,8 @@ class PlayitTests(unittest.TestCase):
             return False, None
 
         agent._playit_api = fake_api
-        self.assertEqual(agent._playit({"op": "playit_start", "local_port": 25565})["status"], "ok")
+        self.assertEqual(
+            agent._playit({"op": "ensure_tunnel", "local_port": 25565})["status"], "connecting")
 
     def test_create_tunnel_named_and_routed_per_port(self):
         captured = {}
