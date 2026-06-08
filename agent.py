@@ -212,17 +212,39 @@ def _playit_rundata(secret):
     return data if ok and isinstance(data, dict) else None
 
 
-def _address_pending(data):
-    """(public_address_or_None, [pending_tunnel_names]) from run-data."""
-    addrs = [t.get("display_address") for t in data.get("tunnels", []) if t.get("display_address")]
-    pending = [t.get("name", "?") for t in data.get("pending", [])]
-    return (addrs[0] if addrs else None), pending
+def _tunnel_name(local_port):
+    """Each hosted server gets its OWN tunnel, keyed by its box-local port, so several
+    servers on one machine don't collide on a single shared tunnel/address."""
+    return f"mc-spawn-{int(local_port)}" if local_port else "mc-spawn"
 
 
-def _playit_address(secret):
-    """(public_address_or_None, [pending_tunnel_names]) from the user's playit account."""
+def _is_ours(name):
+    """A tunnel WE created (vs one the user made by hand)."""
+    return name == "mc-spawn" or (name or "").startswith("mc-spawn-")
+
+
+def _port_address(data, local_port):
+    """(address_or_None, pending_bool) for OUR tunnel matching this local port. With no
+    port (legacy / no-arg call) match any tunnel we created."""
+    want = _tunnel_name(local_port) if local_port else None
+
+    def mine(t):
+        n = t.get("name") or ""
+        return (n == want) if want else _is_ours(n)
+
+    for t in data.get("tunnels", []):
+        if mine(t) and t.get("display_address"):
+            return t["display_address"], False
+    for t in data.get("pending", []):
+        if mine(t):
+            return None, True
+    return None, False
+
+
+def _playit_address(secret, local_port):
+    """(address_or_None, pending_bool) for this port from the user's playit account."""
     data = _playit_rundata(secret)
-    return _address_pending(data) if data is not None else (None, [])
+    return _port_address(data, local_port) if data is not None else (None, False)
 
 
 def _playit_create_tunnel(secret, agent_id, local_port):
@@ -234,7 +256,7 @@ def _playit_create_tunnel(secret, agent_id, local_port):
     `Agent-Key <secret>` — same as rundata). origin.type=agent maps the public
     tunnel to 127.0.0.1:<local_port> on this box."""
     body = {
-        "name": "mc-spawn",
+        "name": _tunnel_name(local_port),
         "tunnel_type": "minecraft-java",
         "port_type": "tcp",
         "port_count": 1,
@@ -254,35 +276,39 @@ def _playit_create_tunnel(secret, agent_id, local_port):
 
 
 def _playit_ensure_tunnel(secret, local_port):
-    """Ensure a tunnel exists for this box; auto-create one if the account has none.
-    Returns (address_or_None, [pending], error_or_None). A freshly created tunnel
-    has no address yet — the caller polls _playit_address for it."""
+    """Ensure THIS port has its own tunnel; auto-create one (named per the port) if it
+    doesn't. Returns (address_or_None, pending_bool, error_or_None). A freshly created
+    tunnel has no address yet — the caller polls _playit_address for it."""
     data = _playit_rundata(secret)
     if data is None:
-        return None, [], "playit недоступен"
-    addr, pending = _address_pending(data)
+        return None, False, "playit недоступен"
+    addr, pending = _port_address(data, local_port)
     if addr or pending:
-        return addr, pending, None  # already have/awaiting a tunnel
+        return addr, pending, None  # this port already has/awaits its tunnel
     if not local_port:
-        return None, [], None  # nothing to create against
+        return None, False, None  # nothing to create against
     agent_id = data.get("agent_id")
     if not agent_id:
-        return None, [], "no agent_id"
+        return None, False, "no agent_id"
     ok, err = _playit_create_tunnel(secret, agent_id, local_port)
     if not ok:
-        return None, [], err or "не удалось создать туннель"
-    return None, [], None  # created; address appears within seconds
+        return None, False, err or "не удалось создать туннель"
+    return None, False, None  # created; address appears within seconds
 
 
-def _playit_delete_tunnels(secret):
-    """Delete the tunnels WE created (name 'mc-spawn') from the user's account, so
-    teardown doesn't leave orphan tunnels behind. Best-effort; never raises. Only
-    touches our own tunnels — any the user made by hand are left alone."""
+def _playit_delete_tunnels(secret, local_port=None):
+    """Delete the tunnels WE created. With `local_port`, only that one server's tunnel;
+    otherwise all of ours (machine teardown). Best-effort; never raises. Only touches
+    our own tunnels — any the user made by hand are left alone."""
     data = _playit_rundata(secret)
     if not data:
         return
+    target = _tunnel_name(local_port) if local_port else None
     for t in data.get("tunnels", []):
-        if t.get("name") != "mc-spawn":
+        name = t.get("name") or ""
+        if not _is_ours(name):
+            continue
+        if target is not None and name != target:
             continue
         tid = t.get("id") or t.get("tunnel_id")
         if tid:
@@ -325,81 +351,69 @@ def _playit_run(secret):
 
 
 def _playit(payload):
-    """Link/report the playit public address. Two-step (the user must approve in a
-    browser between the steps): claim_begin -> show URL; claim_finish -> wait for
-    approval, run playit, return the address. Returns a structured status; never raises."""
+    """Link/report a server's playit public address. The ops are SMALL and quick so the
+    BOT can drive pacing and show live progress (it loops claim_poll / status, editing the
+    message each tick) instead of one multi-minute call that looks frozen. Per-port:
+    each hosted server has its own tunnel keyed by `local_port`. Never raises.
+
+    Ops: claim_begin (mint code/url, or 'linked'); claim_poll (one quick approval check,
+    exchanges+saves the secret on accept); playit_start (run playit + ensure this port's
+    tunnel, fast); status (read this port's address, auto-creating its tunnel);
+    remove_tunnel (delete just this port's tunnel); teardown (full cleanup)."""
     op = payload.get("op")
     local_port = payload.get("local_port")
     secret = _playit_secret()
+
     if op == "teardown":
         _playit_teardown()
         return {"status": "ok"}
+    if op == "remove_tunnel":
+        if secret:
+            _playit_delete_tunnels(secret, local_port)
+        return {"status": "ok"}
     if op == "claim_begin":
-        if secret:  # already linked — ensure a tunnel exists, then report the address
-            _playit_run(secret)  # idempotent; make sure traffic actually flows
-            addr, pending, cerr = _playit_ensure_tunnel(secret, local_port)
-            if not addr and not pending and not cerr:
-                deadline = time.time() + 30
-                while time.time() < deadline:
-                    addr, pending = _playit_address(secret)
-                    if addr:
-                        break
-                    time.sleep(4)
-            return {"status": "linked", "address": addr, "pending": pending}
+        if secret:
+            return {"status": "linked"}  # already linked; bot goes straight to address stage
         code = os.urandom(5).hex()  # matches playit's claim-code format (5 bytes hex)
         ok, _ = _playit_api(
             "/claim/setup", {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
         if not ok:
             return {"status": "error", "error": "playit недоступен"}
         return {"status": "begin", "code": code, "url": "https://playit.gg/claim/" + code}
-    if op == "claim_finish":
+    if op == "claim_poll":
+        # One quick check of the browser-approval state — the bot loops this with its own
+        # pacing + a live "waiting…" message, so nothing blocks for minutes here.
+        if secret:
+            return {"status": "accepted"}  # already linked
         code = payload.get("code", "")
+        _ok, state = _playit_api(
+            "/claim/setup", {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
+        if state == "UserRejected":
+            return {"status": "rejected"}
+        if state != "UserAccepted":
+            return {"status": "waiting"}
+        ok, data = _playit_api("/claim/exchange", {"code": code})
+        if not ok or not isinstance(data, dict) or not data.get("secret_key"):
+            return {"status": "waiting"}
+        _save_playit_secret(data["secret_key"])
+        return {"status": "accepted"}
+    if op == "playit_start":
+        secret = _playit_secret()  # may have just been saved by claim_poll
         if not secret:
-            deadline = time.time() + 100  # bounded wait for the browser approval
-            while time.time() < deadline:
-                _ok, state = _playit_api(
-                    "/claim/setup",
-                    {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
-                if state == "UserAccepted":
-                    break
-                if state == "UserRejected":
-                    return {"status": "rejected"}
-                time.sleep(3)
-            else:
-                return {"status": "waiting"}
-            ok, data = _playit_api("/claim/exchange", {"code": code})
-            if not ok or not isinstance(data, dict) or not data.get("secret_key"):
-                return {"status": "waiting"}
-            secret = data["secret_key"]
-            _save_playit_secret(secret)
+            return {"status": "unlinked"}
         if not _playit_run(secret):
             return {"status": "error", "error": "не удалось запустить playit (docker)"}
-        # Auto-create the tunnel so the user never touches playit's dashboard.
-        _addr, pending, cerr = _playit_ensure_tunnel(secret, local_port)
+        _addr, _pending, cerr = _playit_ensure_tunnel(secret, local_port)
         if cerr:
             return {"status": "error", "error": cerr}
-        deadline = time.time() + 60  # let playit register the tunnel, then read its address
-        while time.time() < deadline:
-            addr, pending = _playit_address(secret)
-            if addr:
-                return {"status": "ok", "address": addr, "pending": pending}
-            time.sleep(4)
-        return {"status": "no_tunnel", "pending": pending}
+        return {"status": "ok"}  # tunnel ensured; bot polls `status` for the address
     if op == "status":
         if not secret:
             return {"status": "unlinked"}
-        # Re-read; auto-create if linked but tunnel-less, then give it a moment.
-        addr, pending, cerr = _playit_ensure_tunnel(secret, local_port)
+        addr, _pending, cerr = _playit_ensure_tunnel(secret, local_port)
         if cerr:
             return {"status": "error", "error": cerr}
-        if not addr and not pending:  # just created — wait briefly for its address
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                addr, pending = _playit_address(secret)
-                if addr:
-                    break
-                time.sleep(4)
-        return {"status": "ok" if addr else "no_tunnel", "address": addr, "pending": pending}
+        return {"status": "ok" if addr else "no_tunnel", "address": addr}
     return {"status": "error", "error": f"unknown playit op {op}"}
 
 

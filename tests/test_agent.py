@@ -54,59 +54,79 @@ class PlayitTests(unittest.TestCase):
         self.assertTrue(res["url"].startswith("https://playit.gg/claim/"))
         self.assertEqual(len(res["code"]), 10)  # 5 bytes hex
 
-    def test_claim_begin_when_already_linked_reports_address(self):
+    def test_claim_begin_when_already_linked(self):
         agent._playit_secret = lambda: "sek"
-        agent._playit_api = lambda path, body, secret=None: (
-            True, {"tunnels": [{"display_address": "joy.gl.at.ply.gg:30000"}], "pending": []})
-        res = agent._playit({"op": "claim_begin"})
-        self.assertEqual(res["status"], "linked")
-        self.assertEqual(res["address"], "joy.gl.at.ply.gg:30000")
+        # No address work here anymore — the bot drives the address stage next.
+        self.assertEqual(agent._playit({"op": "claim_begin"})["status"], "linked")
+
+    def test_claim_poll_accepted_saves_secret(self):
+        agent._playit_secret = lambda: None
+
+        def fake_api(path, body, secret=None):
+            if path == "/claim/setup":
+                return True, "UserAccepted"
+            if path == "/claim/exchange":
+                return True, {"secret_key": "newsek"}
+            return False, None
+
+        agent._playit_api = fake_api
+        with mock.patch.object(agent, "_save_playit_secret") as save:
+            res = agent._playit({"op": "claim_poll", "code": "abcdef"})
+        self.assertEqual(res["status"], "accepted")
+        save.assert_called_once_with("newsek")
+
+    def test_claim_poll_waiting_then_rejected(self):
+        agent._playit_secret = lambda: None
+        agent._playit_api = lambda path, body, secret=None: (True, "WaitingForUserVisit")
+        self.assertEqual(agent._playit({"op": "claim_poll", "code": "x"})["status"], "waiting")
+        agent._playit_api = lambda path, body, secret=None: (True, "UserRejected")
+        self.assertEqual(agent._playit({"op": "claim_poll", "code": "x"})["status"], "rejected")
+
+    def test_playit_start_ensures_tunnel_fast(self):
+        agent._playit_secret = lambda: "sek"
+        agent._playit_run = lambda secret: True
+        calls = []
+
+        def fake_api(path, body, secret=None):
+            calls.append(path)
+            if path == "/v1/agents/rundata":
+                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
+            if path == "/tunnels/create":
+                return True, {"id": "tid"}
+            return False, None
+
+        agent._playit_api = fake_api
+        res = agent._playit({"op": "playit_start", "local_port": 25570})
+        self.assertEqual(res["status"], "ok")  # returns once the tunnel is ensured
+        self.assertIn("/tunnels/create", calls)  # no address-wait loop here
 
     def test_status_unlinked(self):
         agent._playit_secret = lambda: None
         self.assertEqual(agent._playit({"op": "status"})["status"], "unlinked")
 
-    def test_status_reads_display_address(self):
+    def test_status_reads_this_ports_address_not_the_first(self):
         agent._playit_secret = lambda: "sek"
-        agent._playit_api = lambda path, body, secret=None: (
-            True, {"tunnels": [{"display_address": "abc.ply.gg:25"}], "pending": []})
-        res = agent._playit({"op": "status"})
+        agent._playit_api = lambda path, body, secret=None: (True, {
+            "agent_id": "a", "pending": [], "tunnels": [
+                {"name": "mc-spawn-25565", "display_address": "a.ply.gg:1"},
+                {"name": "mc-spawn-25566", "display_address": "b.ply.gg:2"},
+            ]})
+        res = agent._playit({"op": "status", "local_port": 25566})
         self.assertEqual(res["status"], "ok")
-        self.assertEqual(res["address"], "abc.ply.gg:25")
+        self.assertEqual(res["address"], "b.ply.gg:2")  # the matching port, not just the first
 
-    def test_status_no_tunnel_when_only_pending(self):
+    def test_status_no_tunnel_right_after_create(self):
         agent._playit_secret = lambda: "sek"
-        agent._playit_api = lambda path, body, secret=None: (
-            True, {"tunnels": [], "pending": [{"name": "mc"}]})
-        res = agent._playit({"op": "status"})
-        self.assertEqual(res["status"], "no_tunnel")
-        self.assertEqual(res["pending"], ["mc"])
-
-    def test_status_auto_creates_tunnel_when_none(self):
-        """Linked but tunnel-less ⇒ the agent POSTs /tunnels/create itself (no manual
-        dashboard step), then reads back the new address."""
-        agent._playit_secret = lambda: "sek"
-        calls = []
-        state = {"created": False}
 
         def fake_api(path, body, secret=None):
-            calls.append((path, body))
             if path == "/v1/agents/rundata":
-                tunnels = [{"display_address": "new.ply.gg:25"}] if state["created"] else []
-                return True, {"agent_id": "aid", "tunnels": tunnels, "pending": []}
+                return True, {"agent_id": "a", "tunnels": [], "pending": []}
             if path == "/tunnels/create":
-                state["created"] = True
-                return True, {"id": "tid"}
+                return True, {"id": "t"}
             return False, None
 
-        agent._playit_api = fake_api
-        res = agent._playit({"op": "status", "local_port": 25571})
-        self.assertEqual(res["status"], "ok")
-        self.assertEqual(res["address"], "new.ply.gg:25")
-        create = [b for p, b in calls if p == "/tunnels/create"][0]
-        self.assertEqual(create["tunnel_type"], "minecraft-java")
-        self.assertEqual(create["origin"]["data"]["agent_id"], "aid")
-        self.assertEqual(create["origin"]["data"]["local_port"], 25571)
+        agent._playit_api = fake_api  # created but address not yet present
+        self.assertEqual(agent._playit({"op": "status", "local_port": 25565})["status"], "no_tunnel")
 
     def test_create_tunnel_failure_surfaces_error(self):
         agent._playit_secret = lambda: "sek"
@@ -122,6 +142,21 @@ class PlayitTests(unittest.TestCase):
         res = agent._playit({"op": "status", "local_port": 25565})
         self.assertEqual(res["status"], "error")
         self.assertIn("RequiresVerifiedAccount", res["error"])
+
+    def test_create_tunnel_named_and_routed_per_port(self):
+        captured = {}
+
+        def fake_api(path, body, secret=None):
+            if path == "/tunnels/create":
+                captured.update(body)
+                return True, {"id": "t"}
+            return False, None
+
+        agent._playit_api = fake_api
+        ok, _ = agent._playit_create_tunnel("sek", "aid", 25570)
+        self.assertTrue(ok)
+        self.assertEqual(captured["name"], "mc-spawn-25570")
+        self.assertEqual(captured["origin"]["data"]["local_port"], 25570)
 
 
 class TeardownTests(unittest.TestCase):
@@ -148,6 +183,24 @@ class TeardownTests(unittest.TestCase):
         agent._playit_api = fake_api
         agent._playit_delete_tunnels("sek")
         self.assertEqual(deleted, ["t1"])
+
+    def test_delete_tunnels_for_one_port_only(self):
+        deleted = []
+
+        def fake_api(path, body, secret=None):
+            if path == "/v1/agents/rundata":
+                return True, {"tunnels": [
+                    {"name": "mc-spawn-25565", "id": "t1"},
+                    {"name": "mc-spawn-25566", "id": "t2"},
+                ]}
+            if path == "/tunnels/delete":
+                deleted.append(body["tunnel_id"])
+                return True, {}
+            return False, None
+
+        agent._playit_api = fake_api
+        agent._playit_delete_tunnels("sek", local_port=25566)
+        self.assertEqual(deleted, ["t2"])  # only the matching port's tunnel
 
     def test_teardown_is_ok_even_with_no_link(self):
         agent._playit_secret = lambda: None  # nothing linked

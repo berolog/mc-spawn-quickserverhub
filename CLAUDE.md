@@ -15,9 +15,10 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   `_enroll` (one-time `TOKEN` → long-lived secret, persisted `chmod 600`), `main` poll
   loop with backoff, `_execute` dispatch → `_run_shell` (subprocess `bash -c`,
   `SHELL_TIMEOUT=600`), `_rcon` (tiny Source-RCON client to `127.0.0.1`), `_playit`
-  (claim user's playit account via `_playit_api` urllib calls + run playit in docker +
-  read public address; `teardown` → `_playit_teardown`/`_playit_delete_tunnels` clean up on
-  delete). Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party
+  (granular per-port ops: `claim_begin`/`claim_poll`/`playit_start`/`status`/`remove_tunnel`/
+  `teardown` — small & quick so the bot drives pacing/progress; tunnels named per local port
+  via `_tunnel_name`; `_playit_teardown`/`_playit_delete_tunnels` clean up on delete).
+  Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party
   deps — a Go rewrite is a drop-in behind the same HTTP protocol.
 - `install.sh` — **portable POSIX-`sh`** one-liner installer (runs under Alpine's
   busybox ash, not just bash). Reads `CONTROL_URL`/`TOKEN` from env, **detects the
@@ -49,17 +50,18 @@ Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}`; `rcon`
 
 ### `playit` ops (public play address)
 
-All ops take `{local_port}` (the box-local Minecraft port) so the agent can
-**auto-create the tunnel** — the user never touches playit's (English) dashboard.
-`{op}` ∈ `claim_begin` `{local_port}` → `{status:"begin", code, url}` (or `linked`
-with `address`); `claim_finish` `{code, local_port}` → waits for the browser
-approval, runs playit, **auto-creates a Minecraft-Java tunnel if none exists**, →
-`{status:"ok", address}` / `waiting` / `rejected` / `no_tunnel` / `error`;
-`status` `{local_port}` → re-reads (auto-creating if linked-but-tunnel-less) →
-`{status:"ok"|"no_tunnel"|"unlinked"|"error", address}`; `teardown` `{}` → deletes
-the tunnels we created, stops+removes the playit container, drops the stored secret →
-`{status:"ok"}` (best-effort, idempotent — used when a server/machine is deleted so no
-orphan tunnels are left in the user's account).
+Each hosted server has its **own** tunnel keyed by `{local_port}` (named
+`mc-spawn-<local_port>`), so several servers on one box don't collide on a shared
+address; the agent **auto-creates** it (the user never touches playit's English
+dashboard). The ops are deliberately **small and quick** — the bot loops `claim_poll`/
+`status` itself and shows live progress between calls, instead of one op blocking for
+minutes. `{op}` ∈
+- `claim_begin` `{local_port}` → `{status:"begin", code, url}` (mint claim code) or `{status:"linked"}` (already linked).
+- `claim_poll` `{code}` → one quick approval check; on accept it exchanges + saves the secret → `{status:"accepted"|"waiting"|"rejected"}`.
+- `playit_start` `{local_port}` → run playit (docker) + ensure THIS port's tunnel; returns fast `{status:"ok"|"unlinked"|"error"}` (no address wait).
+- `status` `{local_port}` → read this port's address (auto-create its tunnel if missing) → `{status:"ok", address}` / `no_tunnel` / `unlinked` / `error`.
+- `remove_tunnel` `{local_port}` → delete just this port's tunnel → `{status:"ok"}` (one of several servers deleted; playit keeps running for the rest).
+- `teardown` `{}` → delete ALL our tunnels, stop+remove the playit container, drop the secret → `{status:"ok"}` (last server / whole machine deleted). Both delete ops are best-effort, idempotent, and touch only tunnels we created.
 
 **playit.gg API** (`https://api.playit.gg`, JSON, enveloped `{"status":"success","data":..}`):
 `POST /claim/setup {code, agent_type:"self-managed", version}` → `"WaitingForUser*"|"UserAccepted"|"UserRejected"`;
@@ -96,16 +98,18 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
    (operator never holds it → ToS-clean, no resale). The playit secret is stored
    `chmod 600` next to the cred file and is never sent upstream; only the resulting public
    address is reported. Address provider is swappable (bot's `ingress.py`).
-8. **Tunnel is auto-created — no manual dashboard step.** After linking, the agent itself
-   POSTs `/tunnels/create` (Minecraft-Java → `127.0.0.1:<local_port>`) if the account has
-   no tunnel, so the user's only playit interaction is the one-click claim approval. The
-   single unavoidable English screen is that claim page (playit's domain — not translatable).
-   `_playit_run` never raises (docker may be absent ⇒ returns False), keeping invariant 5.
-9. **Teardown leaves no orphans, touches only ours.** `teardown` deletes the tunnels
-   the agent created (filtered by name `mc-spawn` — a user's hand-made tunnels are never
-   touched), stops+removes the playit container, and drops the local secret. It's
-   best-effort and idempotent (no secret / no docker / missing key all fine) so the
-   bot's server/machine deletion always completes.
+8. **Per-port tunnels, auto-created — no manual dashboard step.** Each server's tunnel is
+   named `mc-spawn-<local_port>` and routed to `127.0.0.1:<local_port>`, so multiple
+   servers on one box each get their own address (no shared-tunnel collision). The agent
+   POSTs `/tunnels/create` itself when this port has none, so the user's only playit
+   interaction is the one-click claim approval. The single unavoidable English screen is
+   that claim page (playit's domain — not translatable). `_playit_run` never raises (docker
+   may be absent ⇒ returns False), keeping invariant 5.
+9. **Cleanup leaves no orphans, touches only ours.** `remove_tunnel {local_port}` deletes
+   one server's tunnel; `teardown` deletes ALL of ours + stops the container + drops the
+   secret. Both filter to tunnels WE created (name `mc-spawn` or `mc-spawn-*`) — a user's
+   hand-made tunnels are never touched — and are best-effort + idempotent (no secret / no
+   docker / missing key all fine) so the bot's server/machine deletion always completes.
 
 > **Live-verify note:** the playit claim handshake (browser approval) + tunnel address
 > read can only be confirmed on a real box with a real playit account — not in CI. The
