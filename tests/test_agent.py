@@ -82,6 +82,30 @@ class PlayitTests(unittest.TestCase):
         agent._playit_api = lambda path, body, secret=None: (True, "UserRejected")
         self.assertEqual(agent._playit({"op": "claim_poll", "code": "x"})["status"], "rejected")
 
+    def test_claim_poll_distinguishes_visit_vs_approve(self):
+        # playit's claim is two site steps; the agent surfaces which one is pending.
+        agent._playit_secret = lambda: None
+        agent._playit_api = lambda p, b, secret=None: (True, "WaitingForUserVisit")
+        r = agent._playit({"op": "claim_poll", "code": "x"})
+        self.assertEqual((r["status"], r["stage"]), ("waiting", "visit"))
+        agent._playit_api = lambda p, b, secret=None: (True, "WaitingForUser")
+        r = agent._playit({"op": "claim_poll", "code": "x"})
+        self.assertEqual((r["status"], r["stage"]), ("waiting", "approve"))
+
+    def test_claim_setup_sends_playit_version_shape(self):
+        # A non-"playit <semver>" version makes /tunnels/create fail AgentVersionTooOld.
+        captured = {}
+
+        def fake_api(path, body, secret=None):
+            captured.update(body)
+            return True, "WaitingForUserVisit"
+
+        agent._playit_secret = lambda: None
+        agent._playit_api = fake_api
+        agent._playit({"op": "claim_poll", "code": "abc"})
+        self.assertTrue(captured["version"].startswith("playit "))
+        self.assertEqual(captured["agent_type"], "self-managed")
+
     def test_playit_start_ensures_tunnel_fast(self):
         agent._playit_secret = lambda: "sek"
         agent._playit_run = lambda secret: True
@@ -142,6 +166,22 @@ class PlayitTests(unittest.TestCase):
         res = agent._playit({"op": "status", "local_port": 25565})
         self.assertEqual(res["status"], "error")
         self.assertIn("RequiresVerifiedAccount", res["error"])
+
+    def test_agent_version_too_old_is_transient_not_fatal(self):
+        # While the playit container is still connecting, create can return
+        # AgentVersionTooOld — the agent treats it as "pending" (no_tunnel) so the bot
+        # keeps polling and retries, instead of surfacing a hard error.
+        agent._playit_secret = lambda: "sek"
+
+        def fake_api(path, body, secret=None):
+            if path == "/v1/agents/rundata":
+                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
+            if path == "/tunnels/create":
+                return False, "AgentVersionTooOld"
+            return False, None
+
+        agent._playit_api = fake_api
+        self.assertEqual(agent._playit({"op": "status", "local_port": 25565})["status"], "no_tunnel")
 
     def test_create_tunnel_named_and_routed_per_port(self):
         captured = {}

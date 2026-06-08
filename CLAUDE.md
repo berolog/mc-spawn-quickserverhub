@@ -57,15 +57,22 @@ dashboard). The ops are deliberately **small and quick** — the bot loops `clai
 `status` itself and shows live progress between calls, instead of one op blocking for
 minutes. `{op}` ∈
 - `claim_begin` `{local_port}` → `{status:"begin", code, url}` (mint claim code) or `{status:"linked"}` (already linked).
-- `claim_poll` `{code}` → one quick approval check; on accept it exchanges + saves the secret → `{status:"accepted"|"waiting"|"rejected"}`.
+- `claim_poll` `{code}` → one quick approval check; on accept it exchanges + saves the secret → `{status:"accepted"|"rejected"}` or `{status:"waiting", stage:"visit"|"approve"}` (`visit` = link not opened yet; `approve` = opened, the Add/Next/Allow click still pending — the bot shows the matching hint).
 - `playit_start` `{local_port}` → run playit (docker) + ensure THIS port's tunnel; returns fast `{status:"ok"|"unlinked"|"error"}` (no address wait).
 - `status` `{local_port}` → read this port's address (auto-create its tunnel if missing) → `{status:"ok", address}` / `no_tunnel` / `unlinked` / `error`.
 - `remove_tunnel` `{local_port}` → delete just this port's tunnel → `{status:"ok"}` (one of several servers deleted; playit keeps running for the rest).
 - `teardown` `{}` → delete ALL our tunnels, stop+remove the playit container, drop the secret → `{status:"ok"}` (last server / whole machine deleted). Both delete ops are best-effort, idempotent, and touch only tunnels we created.
 
-**playit.gg API** (`https://api.playit.gg`, JSON, enveloped `{"status":"success","data":..}`):
-`POST /claim/setup {code, agent_type:"self-managed", version}` → `"WaitingForUser*"|"UserAccepted"|"UserRejected"`;
-`POST /claim/exchange {code}` → `{secret_key}`;
+**playit.gg API** (`https://api.playit.gg`, JSON, enveloped `{"status":"success","data":..}`,
+verified against playit-agent v1.0.9):
+`POST /claim/setup {code, agent_type:"self-managed", version}` → `data` ∈ `"WaitingForUserVisit"`
+(link not opened), `"WaitingForUser"` (opened, awaiting the approve/Next click — **claim is TWO
+site steps, not one**), `"UserAccepted"`, `"UserRejected"`. **`version` MUST be `"playit <semver>"`**
+(the real client sends `format!("playit {}", CARGO_PKG_VERSION)` → e.g. `"playit 1.0.9"`); a
+bad/old value (e.g. `"mc-spawn-agent 1"`) is stored as the agent's version and later makes
+`POST /tunnels/create` fail with **`AgentVersionTooOld`**. We send `PLAYIT_VERSION` (env-overridable,
+default `"playit 1.0.9"` — bump as playit's minimum rises);
+`POST /claim/exchange {code}` → `{secret_key}` (after UserAccepted);
 `POST /v1/agents/rundata` (auth `Authorization: Agent-Key <secret>`) → `{agent_id, tunnels:[{display_address}], pending:[]}`;
 `POST /tunnels/create` (same Agent-Key auth) `{name, tunnel_type:"minecraft-java", port_type:"tcp", port_count:1, origin:{type:"agent", data:{agent_id, local_ip:"127.0.0.1", local_port}}, enabled:true, alloc:null, firewall_id:null, proxy_protocol:null}` → `{id}` (errors are bare enum strings, e.g. `"RequiresVerifiedAccount"`). Wire format verified against playit-agent's `api_client` crate.
 `POST /tunnels/delete` (same Agent-Key auth) `{tunnel_id}` → used by `teardown`; the agent deletes only tunnels named `mc-spawn` (the ones it created), never the user's own.
@@ -111,9 +118,13 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
    hand-made tunnels are never touched — and are best-effort + idempotent (no secret / no
    docker / missing key all fine) so the bot's server/machine deletion always completes.
 
-> **Live-verify note:** the playit claim handshake (browser approval) + tunnel address
-> read can only be confirmed on a real box with a real playit account — not in CI. The
-> pure dispatch/parse paths are unit-tested; the live flow needs one hands-on pass.
+> **Live-verify note:** the playit claim handshake + tunnel create/delete/address read can
+> only be fully confirmed on a real box with a real playit account — not in CI. Verified
+> against playit-agent **v1.0.9** source: claim is **two site steps** (`WaitingForUserVisit`
+> → `WaitingForUser` → `UserAccepted`) and the `/claim/setup` `version` must be `"playit
+> <semver>"` or `/tunnels/create` returns `AgentVersionTooOld` (we send `PLAYIT_VERSION`,
+> default `"playit 1.0.9"`, and treat a transient `AgentVersionTooOld` as retryable). The
+> pure dispatch/parse paths are unit-tested; the end-to-end browser flow needs one hands-on pass.
 
 ## Run / test
 

@@ -164,7 +164,13 @@ PLAYIT_API = os.environ.get("PLAYIT_API", "https://api.playit.gg").rstrip("/")
 PLAYIT_IMAGE = os.environ.get("PLAYIT_IMAGE", "ghcr.io/playit-cloud/playit-agent:latest")
 PLAYIT_CONTAINER = "mc-spawn-playit"
 PLAYIT_KEY_PATH = os.path.join(os.path.dirname(STATE_PATH) or ".", "playit.key")
-PLAYIT_VERSION = "mc-spawn-agent 1"
+# playit checks this at /claim/setup and remembers it as the agent's version; a bad/old
+# value makes a later /tunnels/create fail with `AgentVersionTooOld`. The real client
+# sends "playit <semver>" (format!("playit {}", CARGO_PKG_VERSION)), so we MUST mimic that
+# exact shape with a current version — not "mc-spawn-agent". Bump as playit's minimum rises;
+# overridable via env. (The playit docker container itself reports its own real version once
+# it connects, but we may create the tunnel before that, so the claim version must be valid.)
+PLAYIT_VERSION = os.environ.get("PLAYIT_VERSION", "playit 1.0.9")
 
 
 def _playit_api(path, body, secret=None):
@@ -292,6 +298,11 @@ def _playit_ensure_tunnel(secret, local_port):
         return None, False, "no agent_id"
     ok, err = _playit_create_tunnel(secret, agent_id, local_port)
     if not ok:
+        if err == "AgentVersionTooOld":
+            # The playit container hasn't reported its version to the backend yet — this is
+            # transient. Report "pending" so the bot keeps polling and retries create next
+            # tick (by which point the agent has connected and the version is accepted).
+            return None, True, None
         return None, False, err or "не удалось создать туннель"
     return None, False, None  # created; address appears within seconds
 
@@ -390,11 +401,15 @@ def _playit(payload):
             "/claim/setup", {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
         if state == "UserRejected":
             return {"status": "rejected"}
-        if state != "UserAccepted":
-            return {"status": "waiting"}
+        # playit's claim is TWO site steps; surface which one is still pending so the bot
+        # can tell the user exactly what to do (open the link vs. approve it on the page).
+        if state == "WaitingForUserVisit":
+            return {"status": "waiting", "stage": "visit"}
+        if state != "UserAccepted":  # WaitingForUser (or anything not-yet-accepted)
+            return {"status": "waiting", "stage": "approve"}
         ok, data = _playit_api("/claim/exchange", {"code": code})
         if not ok or not isinstance(data, dict) or not data.get("secret_key"):
-            return {"status": "waiting"}
+            return {"status": "waiting", "stage": "approve"}
         _save_playit_secret(data["secret_key"])
         return {"status": "accepted"}
     if op == "playit_start":
