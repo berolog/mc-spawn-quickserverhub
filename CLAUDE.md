@@ -34,6 +34,20 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   one per backend; all exec `run.sh`).
 - `tests/test_agent.py` — pure: shell executor, `_execute` dispatch, RCON soft-error path.
 
+## Target / roadmap (canonical — see mc-spawn-bot PLAN.md §12–13)
+
+The agent is part of the BYOS goal: run on the user's **own hardware, Linux AND
+Windows** (current code is Linux/POSIX-only). Two committed directions:
+
+- **Windows support (PLAN Phase 6).** A PowerShell one-liner installer (parallel to
+  `install.sh`), run as a **Windows service** (NSSM / `sc.exe` / Scheduled Task) instead
+  of systemd/OpenRC, detect **Docker Desktop / WSL2**, and keep volume/path handling
+  cross-platform. Same outbound-only protocol — no inbound ports on the box either OS.
+- **Versioned protocol → drop-in compiled binary.** `agent.py` stays **stdlib-only** so a
+  Go/compiled rewrite is drop-in behind the **same HTTP protocol**. The protocol carries a
+  `protocol_version` so bot/agent can negotiate; the table below is a **frozen contract** —
+  bump the version and update both repos together when it changes.
+
 ## Protocol (must match mc-spawn-bot's `control_api.py`)
 
 The agent is a client of these endpoints; **changing them is a cross-repo contract**:
