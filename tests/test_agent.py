@@ -7,6 +7,7 @@ control plane or a network.
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # agent.py lives at the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -121,6 +122,39 @@ class PlayitTests(unittest.TestCase):
         res = agent._playit({"op": "status", "local_port": 25565})
         self.assertEqual(res["status"], "error")
         self.assertIn("RequiresVerifiedAccount", res["error"])
+
+
+class TeardownTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = (agent._playit_secret, agent._playit_api)
+
+    def tearDown(self):
+        agent._playit_secret, agent._playit_api = self._orig
+
+    def test_delete_tunnels_only_targets_ours(self):
+        deleted = []
+
+        def fake_api(path, body, secret=None):
+            if path == "/v1/agents/rundata":
+                return True, {"tunnels": [
+                    {"name": "mc-spawn", "id": "t1"},
+                    {"name": "user-made-by-hand", "id": "t2"},  # leave the user's own alone
+                ]}
+            if path == "/tunnels/delete":
+                deleted.append(body["tunnel_id"])
+                return True, {}
+            return False, None
+
+        agent._playit_api = fake_api
+        agent._playit_delete_tunnels("sek")
+        self.assertEqual(deleted, ["t1"])
+
+    def test_teardown_is_ok_even_with_no_link(self):
+        agent._playit_secret = lambda: None  # nothing linked
+        with mock.patch.object(agent.subprocess, "run"), \
+                mock.patch.object(agent.os, "remove", side_effect=OSError):
+            res = agent._playit({"op": "teardown"})
+        self.assertEqual(res["status"], "ok")
 
 
 class RconErrorPathTests(unittest.TestCase):

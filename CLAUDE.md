@@ -16,7 +16,8 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   loop with backoff, `_execute` dispatch → `_run_shell` (subprocess `bash -c`,
   `SHELL_TIMEOUT=600`), `_rcon` (tiny Source-RCON client to `127.0.0.1`), `_playit`
   (claim user's playit account via `_playit_api` urllib calls + run playit in docker +
-  read public address). Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party
+  read public address; `teardown` → `_playit_teardown`/`_playit_delete_tunnels` clean up on
+  delete). Talks to `CONTROL_URL` via `_http` (Bearer secret). No third-party
   deps — a Go rewrite is a drop-in behind the same HTTP protocol.
 - `install.sh` — **portable POSIX-`sh`** one-liner installer (runs under Alpine's
   busybox ash, not just bash). Reads `CONTROL_URL`/`TOKEN` from env, **detects the
@@ -55,13 +56,17 @@ with `address`); `claim_finish` `{code, local_port}` → waits for the browser
 approval, runs playit, **auto-creates a Minecraft-Java tunnel if none exists**, →
 `{status:"ok", address}` / `waiting` / `rejected` / `no_tunnel` / `error`;
 `status` `{local_port}` → re-reads (auto-creating if linked-but-tunnel-less) →
-`{status:"ok"|"no_tunnel"|"unlinked"|"error", address}`.
+`{status:"ok"|"no_tunnel"|"unlinked"|"error", address}`; `teardown` `{}` → deletes
+the tunnels we created, stops+removes the playit container, drops the stored secret →
+`{status:"ok"}` (best-effort, idempotent — used when a server/machine is deleted so no
+orphan tunnels are left in the user's account).
 
 **playit.gg API** (`https://api.playit.gg`, JSON, enveloped `{"status":"success","data":..}`):
 `POST /claim/setup {code, agent_type:"self-managed", version}` → `"WaitingForUser*"|"UserAccepted"|"UserRejected"`;
 `POST /claim/exchange {code}` → `{secret_key}`;
 `POST /v1/agents/rundata` (auth `Authorization: Agent-Key <secret>`) → `{agent_id, tunnels:[{display_address}], pending:[]}`;
 `POST /tunnels/create` (same Agent-Key auth) `{name, tunnel_type:"minecraft-java", port_type:"tcp", port_count:1, origin:{type:"agent", data:{agent_id, local_ip:"127.0.0.1", local_port}}, enabled:true, alloc:null, firewall_id:null, proxy_protocol:null}` → `{id}` (errors are bare enum strings, e.g. `"RequiresVerifiedAccount"`). Wire format verified against playit-agent's `api_client` crate.
+`POST /tunnels/delete` (same Agent-Key auth) `{tunnel_id}` → used by `teardown`; the agent deletes only tunnels named `mc-spawn` (the ones it created), never the user's own.
 The user links their **own** playit account (claim flow); the secret is stored
 `chmod 600` on the box and **never** sent to the control plane. playit runs as a
 docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
@@ -96,6 +101,11 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
    no tunnel, so the user's only playit interaction is the one-click claim approval. The
    single unavoidable English screen is that claim page (playit's domain — not translatable).
    `_playit_run` never raises (docker may be absent ⇒ returns False), keeping invariant 5.
+9. **Teardown leaves no orphans, touches only ours.** `teardown` deletes the tunnels
+   the agent created (filtered by name `mc-spawn` — a user's hand-made tunnels are never
+   touched), stops+removes the playit container, and drops the local secret. It's
+   best-effort and idempotent (no secret / no docker / missing key all fine) so the
+   bot's server/machine deletion always completes.
 
 > **Live-verify note:** the playit claim handshake (browser approval) + tunnel address
 > read can only be confirmed on a real box with a real playit account — not in CI. The

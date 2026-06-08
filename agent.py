@@ -274,6 +274,40 @@ def _playit_ensure_tunnel(secret, local_port):
     return None, [], None  # created; address appears within seconds
 
 
+def _playit_delete_tunnels(secret):
+    """Delete the tunnels WE created (name 'mc-spawn') from the user's account, so
+    teardown doesn't leave orphan tunnels behind. Best-effort; never raises. Only
+    touches our own tunnels — any the user made by hand are left alone."""
+    data = _playit_rundata(secret)
+    if not data:
+        return
+    for t in data.get("tunnels", []):
+        if t.get("name") != "mc-spawn":
+            continue
+        tid = t.get("id") or t.get("tunnel_id")
+        if tid:
+            # playit-agent's api_client: POST /tunnels/delete {tunnel_id}.
+            _playit_api("/tunnels/delete", {"tunnel_id": tid}, secret=secret)
+
+
+def _playit_teardown():
+    """Tear playit down on this box: delete our tunnels, stop+remove the playit
+    container, drop the stored secret. Idempotent and never raises (docker/key may
+    be absent) so machine/server deletion always proceeds."""
+    secret = _playit_secret()
+    if secret:
+        _playit_delete_tunnels(secret)
+    try:
+        subprocess.run(["docker", "rm", "-f", PLAYIT_CONTAINER],
+                       capture_output=True, text=True, timeout=30)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        os.remove(PLAYIT_KEY_PATH)
+    except OSError:
+        pass
+
+
 def _playit_run(secret):
     """(Re)start the playit agent under the user's secret via docker on the host network
     (so it reaches 127.0.0.1:<mc_port>). Idempotent; never raises (docker may be
@@ -297,6 +331,9 @@ def _playit(payload):
     op = payload.get("op")
     local_port = payload.get("local_port")
     secret = _playit_secret()
+    if op == "teardown":
+        _playit_teardown()
+        return {"status": "ok"}
     if op == "claim_begin":
         if secret:  # already linked — ensure a tunnel exists, then report the address
             _playit_run(secret)  # idempotent; make sure traffic actually flows
