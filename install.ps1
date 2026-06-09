@@ -49,19 +49,14 @@ function Refresh-Path {
 
 function Winget-Install ($id) {
     if (-not (Have winget)) { return $false }
-    Log "installing $id via winget"
+    Log "installing $id via winget (per-user — no admin prompt)"
     try {
-        # --scope machine where possible so the exe lands on a PATH the task user shares;
-        # winget falls back to user scope if machine isn't supported for the package.
-        winget install --id $id --scope machine --silent --accept-source-agreements `
+        # Per-user scope on purpose: the Scheduled Task runs AS THIS USER, so a user-scope
+        # install is what it needs — and it avoids the UAC prompt that --scope machine
+        # triggers (which made the installer appear to hang behind a modal dialog).
+        winget install --id $id --scope user --silent --accept-source-agreements `
             --accept-package-agreements --disable-interactivity 2>$null | Out-Null
     } catch { }
-    if ($LASTEXITCODE -ne 0) {
-        try {
-            winget install --id $id --silent --accept-source-agreements `
-                --accept-package-agreements --disable-interactivity 2>$null | Out-Null
-        } catch { }
-    }
     Refresh-Path
     return $true
 }
@@ -112,42 +107,6 @@ if (-not $Python) {
 }
 Log "using Python at $Python"
 
-# ---- bash (Git for Windows) — needed to host a server, not to run the agent ----
-if (-not (Have bash)) { Winget-Install 'Git.Git' | Out-Null }
-if (-not (Have bash)) {
-    Warn 'bash not found — monitoring/RCON will work, but hosting a server needs bash (install Git for Windows or enable WSL).'
-}
-
-# ---- container engine: prefer the lightweight, license-free Podman -------------
-# All of docker/podman/nerdctl work (the agent auto-detects via $MCSPAWN_RT). On
-# Windows we DEFAULT to Podman: it's free, CLI-only, and doesn't require Docker
-# Desktop. (Containers still run in a small WSL2 VM that `podman machine` sets up.)
-function Ensure-Engine {
-    if (Have docker)  { Log 'docker present'; return }
-    if (Have nerdctl) { Log 'nerdctl present'; return }
-    if (-not (Have podman)) {
-        Log 'no container engine — installing Podman (lightweight, no Docker Desktop)'
-        Winget-Install 'RedHat.Podman' | Out-Null
-    }
-    if (-not (Have podman)) {
-        Warn 'No container engine installed. To host a server, install Podman (`winget install RedHat.Podman`) or Docker Desktop. Monitoring/RCON work without one.'
-        return
-    }
-    # podman needs a one-time WSL2-backed machine; best-effort, non-fatal.
-    try {
-        $machines = (& podman machine list --format '{{.Name}}' 2>$null)
-        if (-not $machines) {
-            Log 'initialising the Podman machine (one-time, uses WSL2)…'
-            & podman machine init 2>$null | Out-Null
-        }
-        & podman machine start 2>$null | Out-Null
-        Log 'podman ready'
-    } catch {
-        Warn 'Podman is installed but its machine could not start — run `podman machine init; podman machine start` once (needs WSL2; enable it with `wsl --install` and reboot if missing).'
-    }
-}
-try { Ensure-Engine } catch { Warn "container-engine setup skipped: $_" }
-
 # ---- fetch agent.py ----
 Log 'fetching agent.py'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -185,6 +144,18 @@ $action   = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" 
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
+# Clear any task from a previous run first — an old version registered it under SYSTEM,
+# which a non-admin run can't overwrite (that's the "Access is denied" on register).
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existing) {
+    try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
+    catch {
+        Die ("a task named '$TaskName' from a previous run can't be replaced without admin. " +
+             "Run this ONCE in an elevated PowerShell, then re-run the installer:`n" +
+             "    schtasks /delete /tn $TaskName /f")
+    }
+}
+
 try {
     if ($IsAdmin) {
         # S4U: runs as the current user at startup, no stored password, has internet
@@ -192,17 +163,55 @@ try {
         $triggers  = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -AtLogOn))
         $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType S4U -RunLevel Highest
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
-            -Principal $principal -Settings $settings -Force | Out-Null
+            -Principal $principal -Settings $settings | Out-Null
         Log "installed as a Scheduled Task running at startup as $UserId"
     } else {
-        $trigger   = New-ScheduledTaskTrigger -AtLogOn
-        $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive
+        # No explicit principal: defaults to the creating user, runs only while logged on —
+        # the permission-friendliest form for a non-admin (avoids the S4U/RunLevel grant).
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-            -Principal $principal -Settings $settings -Force | Out-Null
+            -Settings $settings | Out-Null
         Log "installed as a per-user Scheduled Task running at logon as $UserId"
     }
     Start-ScheduledTask -TaskName $TaskName
-    Log 'mc-spawn agent installed and started. Управление — в Telegram-боте.'
+    Log 'mc-spawn agent installed and started — the bot will see it shortly.'
 } catch {
     Die "could not register the Scheduled Task: $_"
 }
+
+# ---- hosting prerequisites (best-effort, AFTER the agent is up so the bot sees it) ----
+# These are only needed to HOST a server (not to enroll / monitor / RCON). They can be
+# slow (Podman downloads a small WSL2 VM image), so we do them last — Ctrl-C here leaves
+# a working, enrolled agent; you can re-run the installer or set them up by hand later.
+if (-not (Have bash)) {
+    Log 'installing Git for Windows (provides bash, needed to host a server)…'
+    Winget-Install 'Git.Git' | Out-Null
+}
+if (-not (Have bash)) {
+    Warn 'bash not found — monitoring/RCON work, but hosting a server needs bash (install Git for Windows or enable WSL).'
+}
+
+# Container engine — prefer the lightweight, license-free Podman over Docker Desktop.
+if ((Have docker) -or (Have nerdctl)) {
+    Log 'container engine already present'
+} else {
+    if (-not (Have podman)) {
+        Log 'installing Podman (lightweight, no Docker Desktop / no license)…'
+        Winget-Install 'RedHat.Podman' | Out-Null
+    }
+    if (Have podman) {
+        try {
+            if (-not (& podman machine list --format '{{.Name}}' 2>$null)) {
+                Log 'setting up the Podman machine — downloads a small WSL2 VM, can take a few minutes…'
+                & podman machine init 2>$null | Out-Null
+            }
+            & podman machine start 2>$null | Out-Null
+            Log 'podman ready'
+        } catch {
+            Warn 'Podman installed but its machine is not running yet — run once: `podman machine init; podman machine start` (needs WSL2: `wsl --install` + reboot if missing).'
+        }
+    } else {
+        Warn 'No container engine yet. To host a server install Podman (`winget install RedHat.Podman`) or Docker Desktop. Monitoring/RCON already work.'
+    }
+}
+Log 'done. Управление — в Telegram-боте.'
