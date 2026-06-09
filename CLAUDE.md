@@ -108,7 +108,12 @@ docker container (`ghcr.io/playit-cloud/playit-agent`, host network).
    default UA makes enroll/poll silently fail at the edge. Never revert to no UA.
 3. **Secrets never logged, `chmod 600`.** The long-lived secret lives in `AGENT_STATE`
    (default `/etc/mc-spawn-agent/cred.json`); the one-time `TOKEN` is used once then the
-   stored secret is authoritative. Never print either.
+   stored secret is authoritative. Never print either. A `401` on `/poll` means the stored
+   secret is no longer recognised (e.g. the control plane's DB was reset). `main` then makes
+   **one** re-enroll attempt: `_enroll` returns the new secret only if a fresh, unused `TOKEN`
+   is present (the token is single-use, consumed server-side), in which case we adopt it and
+   carry on; otherwise we `exit(1)` so the operator re-pairs — never crash-loop a poll the
+   secret can't satisfy. `_enroll` returns `None` (not `sys.exit`) so callers own that policy.
 4. **RCON stays on loopback.** `_rcon` only ever connects to `127.0.0.1` — the server is
    local; we never expose or dial a remote RCON.
 5. **Executors never raise into the loop.** `_run_shell`/`_rcon` catch everything and

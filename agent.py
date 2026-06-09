@@ -77,13 +77,17 @@ def _save_state(state):
 
 
 def _enroll():
+    """Redeem the one-time TOKEN for a long-lived secret. Returns the new secret,
+    or None if no token is set or enrollment was rejected — the caller decides
+    whether that is fatal. The enroll token is single-use (consumed server-side on
+    success), so a repeat attempt with a stale/used token correctly returns None."""
     if not TOKEN:
         _log("no stored creds and no TOKEN env — cannot enroll")
-        sys.exit(1)
+        return None
     status, data = _http("POST", "/enroll", {"token": TOKEN}, timeout=20)
     if status != 200 or not data:
         _log(f"enroll failed (HTTP {status})")
-        sys.exit(1)
+        return None
     _save_state({"machine_id": data["machine_id"], "secret": data["secret"]})
     _log(f"enrolled as machine {data['machine_id']}")
     return data["secret"]
@@ -450,6 +454,8 @@ def main():
         sys.exit(1)
     state = _load_state()
     secret = state["secret"] if state else _enroll()
+    if not secret:
+        sys.exit(1)
     _log("running; polling for commands")
     backoff = 1
     while True:
@@ -461,8 +467,17 @@ def main():
             elif status in (200, 204):
                 pass  # no command this cycle
             elif status == 401:
-                _log("unauthorized — secret rejected; stopping")
-                sys.exit(1)
+                # The long-lived secret is no longer recognised (e.g. the control
+                # plane's DB was reset). Try one re-enroll: succeeds only if a fresh,
+                # unused TOKEN is present — then we adopt the new secret and carry on.
+                # Otherwise exit so the operator re-pairs, instead of crash-looping
+                # a poll the secret can never satisfy.
+                _log("unauthorized — secret rejected; attempting re-enroll")
+                new_secret = _enroll()
+                if not new_secret:
+                    _log("re-enroll failed (need a fresh TOKEN from the bot); stopping")
+                    sys.exit(1)
+                secret = new_secret
             backoff = 1
         except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
             _log(f"poll error ({type(e).__name__}); retry in {backoff}s")

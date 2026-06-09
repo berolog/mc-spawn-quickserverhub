@@ -292,5 +292,70 @@ class RconErrorPathTests(unittest.TestCase):
         self.assertIn("RCON", res["text"])
 
 
+class _Stop(Exception):
+    """Sentinel to break main()'s infinite poll loop in tests (it is not one of the
+    network errors main catches, so it propagates straight out)."""
+
+
+class EnrollTests(unittest.TestCase):
+    def test_enroll_returns_none_without_token(self):
+        with mock.patch.object(agent, "TOKEN", ""):
+            self.assertIsNone(agent._enroll())
+
+    def test_enroll_returns_none_on_http_error(self):
+        with mock.patch.object(agent, "TOKEN", "tok"), \
+             mock.patch.object(agent, "_http", return_value=(401, None)):
+            self.assertIsNone(agent._enroll())
+
+    def test_enroll_saves_and_returns_secret(self):
+        with mock.patch.object(agent, "TOKEN", "tok"), \
+             mock.patch.object(agent, "_http", return_value=(200, {"machine_id": 7, "secret": "s3"})), \
+             mock.patch.object(agent, "_save_state") as save:
+            self.assertEqual(agent._enroll(), "s3")
+            save.assert_called_once_with({"machine_id": 7, "secret": "s3"})
+
+
+class MainReenrollTests(unittest.TestCase):
+    def test_exits_when_no_creds_and_no_token(self):
+        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
+             mock.patch.object(agent, "_load_state", return_value=None), \
+             mock.patch.object(agent, "_enroll", return_value=None):
+            with self.assertRaises(SystemExit):
+                agent.main()
+
+    def test_401_reenrolls_and_continues_with_new_secret(self):
+        polls = []
+
+        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
+            if path == "/poll":
+                polls.append(secret)
+                if len(polls) == 1:
+                    return 401, None      # stale secret rejected
+                raise _Stop               # second poll: end the loop
+            raise AssertionError(f"unexpected call to {path}")
+
+        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
+             mock.patch.object(agent, "_load_state", return_value={"machine_id": 1, "secret": "old"}), \
+             mock.patch.object(agent, "_enroll", return_value="new") as enroll, \
+             mock.patch.object(agent, "_http", side_effect=fake_http):
+            with self.assertRaises(_Stop):
+                agent.main()
+        enroll.assert_called_once()
+        self.assertEqual(polls, ["old", "new"])  # adopted the re-enrolled secret
+
+    def test_401_exits_when_reenroll_fails(self):
+        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
+            if path == "/poll":
+                return 401, None
+            raise AssertionError(f"unexpected call to {path}")
+
+        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
+             mock.patch.object(agent, "_load_state", return_value={"machine_id": 1, "secret": "old"}), \
+             mock.patch.object(agent, "_enroll", return_value=None), \
+             mock.patch.object(agent, "_http", side_effect=fake_http):
+            with self.assertRaises(SystemExit):
+                agent.main()
+
+
 if __name__ == "__main__":
     unittest.main()
