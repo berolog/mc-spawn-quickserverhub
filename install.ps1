@@ -144,18 +144,33 @@ $action   = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" 
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
-# Clear any task from a previous run first — an old version registered it under SYSTEM,
-# which a non-admin run can't overwrite (that's the "Access is denied" on register).
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing) {
-    try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
-    catch {
-        Die ("a task named '$TaskName' from a previous run can't be replaced without admin. " +
-             "Run this ONCE in an elevated PowerShell, then re-run the installer:`n" +
-             "    schtasks /delete /tn $TaskName /f")
-    }
+# Fallback autostart for when the Task Scheduler is off-limits (many standard-user /
+# locked-down boxes deny registering a task in the root folder — that's the "Access is
+# denied" some users hit). The HKCU Run key needs NO admin and NO Task Scheduler access;
+# it starts the agent at every logon. A tiny .vbs launches run.cmd hidden (no console
+# flash). Trade-off vs the task: logon-only (not pre-login boot) and no restart-on-crash,
+# but the agent already self-recovers its connection, so this is a fine degradation.
+function Install-RunKeyAutostart {
+    # .vbs launches run.cmd hidden (window mode 0) — no console flash at logon. In a
+    # double-quoted here-string `"` is literal, so `""` is VBS's escaped quote.
+    $vbs = Join-Path $Dir 'launch.vbs'
+    @"
+CreateObject("WScript.Shell").Run "cmd /c ""$Run""", 0, False
+"@ | Set-Content -Path $vbs -Encoding ASCII
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    New-ItemProperty -Path $runKey -Name $TaskName -Value "wscript.exe `"$vbs`"" `
+        -PropertyType String -Force | Out-Null
+    Start-Process wscript.exe -ArgumentList "`"$vbs`""   # start now, hidden
+    Log 'installed via per-user startup (Run key) — starts at logon. The bot will see it shortly.'
 }
 
+# Best-effort: clear any task a previous run left (old versions registered one under
+# SYSTEM). If we can't, no problem — we just won't reuse the task path.
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false } catch { }
+}
+
+$registered = $false
 try {
     if ($IsAdmin) {
         # S4U: runs as the current user at startup, no stored password, has internet
@@ -164,19 +179,22 @@ try {
         $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType S4U -RunLevel Highest
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
             -Principal $principal -Settings $settings | Out-Null
-        Log "installed as a Scheduled Task running at startup as $UserId"
     } else {
-        # No explicit principal: defaults to the creating user, runs only while logged on —
-        # the permission-friendliest form for a non-admin (avoids the S4U/RunLevel grant).
+        # No explicit principal: defaults to the creating user, runs only while logged on.
         $trigger = New-ScheduledTaskTrigger -AtLogOn
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
             -Settings $settings | Out-Null
-        Log "installed as a per-user Scheduled Task running at logon as $UserId"
     }
     Start-ScheduledTask -TaskName $TaskName
-    Log 'mc-spawn agent installed and started — the bot will see it shortly.'
+    $registered = $true
+    Log "installed as a Scheduled Task (runs as $UserId) — the bot will see it shortly."
 } catch {
-    Die "could not register the Scheduled Task: $_"
+    # Most common: standard user denied the root task folder. Degrade, don't die.
+    Warn "Task Scheduler unavailable ($($_.Exception.Message)) — falling back to per-user startup."
+}
+if (-not $registered) {
+    try { Install-RunKeyAutostart }
+    catch { Die "could not set up autostart (Task Scheduler and Run key both failed): $_" }
 }
 
 # ---- hosting prerequisites (best-effort, AFTER the agent is up so the bot sees it) ----

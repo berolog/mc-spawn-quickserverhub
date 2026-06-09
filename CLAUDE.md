@@ -42,8 +42,13 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   unrefreshed PATH — both were silent-failure bugs) and bakes it into a user-ACL'd `run.cmd`
   launcher (carries the env so the token isn't world-readable — the Win analogue of `chmod 600`).
   Registers a **Scheduled Task** (no NSSM dep) that runs **as the current user, never SYSTEM**
-  (so it sees the user's Python/engine): S4U @startup if admin (no login needed), else Interactive
-  @logon; restart-on-fail. Install dir is per-user `%LOCALAPPDATA%\mc-spawn-agent`.
+  (so it sees the user's Python/engine): S4U @startup if admin (no login needed), else @logon;
+  restart-on-fail. **If the Task Scheduler is denied** (locked-down standard users can't write the
+  root task folder → "Access is denied"), it **falls back to an HKCU `…\Run` key** + a hidden
+  `launch.vbs` (no admin, logon-start) instead of failing. winget installs are **per-user scope**
+  (avoids the UAC prompt that machine-scope triggers). The agent is registered+started **before**
+  the slow hosting prereqs (Git/Podman) so the bot sees it even if those hang. Install dir is
+  per-user `%LOCALAPPDATA%\mc-spawn-agent`.
 - `mc-spawn-agent.service` — reference systemd unit (install.sh generates the real
   one per backend; all exec `run.sh`).
 - `tests/test_agent.py` — pure: shell executor, `_execute` dispatch, RCON soft-error path,
@@ -192,7 +197,7 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
 13. **Full self-uninstall on machine delete.** The `uninstall` `{containers}` command purges the
     listed MC containers + their `_data` volumes and tears down playit **synchronously**, then spawns
     a **detached** cleanup (systemd-run / new-session `sh`, or PowerShell on Windows) that removes the
-    service/Scheduled-Task + the agent's own files a few seconds later — surviving the agent's death
+    service/Scheduled-Task (+ the HKCU `…\Run` fallback value on Windows) + the agent's own files a few seconds later — surviving the agent's death
     when its service is stopped (and the agent.py file-lock on Windows). The agent reports the result
     then `sys.exit(0)` so the (being-removed) service doesn't relaunch it. Best-effort + idempotent.
     The launchers (`run.sh`/`run.cmd`) **re-fetch `agent.py` from `AGENT_RAW` if it was deleted**, so

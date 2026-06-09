@@ -578,11 +578,14 @@ def _spawn_self_cleanup():
     unit) so stopping our own service doesn't kill it mid-cleanup."""
     d, state_dir = _agent_paths()
     if IS_WINDOWS:
-        # schtasks delete is synchronous-safe; the file delete waits out the lock on the
-        # running agent.py, then removes the dir tree.
+        # Remove BOTH autostart forms the installer may have used: the Scheduled Task and
+        # the HKCU Run-key fallback. schtasks delete is synchronous-safe; the file delete
+        # waits out the lock on the running agent.py, then removes the dir tree.
         ps = (
             f"Start-Sleep 5; "
             f"schtasks /delete /tn {SERVICE_NAME} /f 2>$null; "
+            f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' "
+            f"-Name '{SERVICE_NAME}' -ErrorAction SilentlyContinue; "
             f"Remove-Item -Recurse -Force '{d}','{state_dir}' -ErrorAction SilentlyContinue"
         )
         subprocess.Popen(
