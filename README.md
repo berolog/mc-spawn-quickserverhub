@@ -78,10 +78,17 @@ $env:CONTROL_URL='https://agent.quickserverhub.com'; $env:TOKEN='<one-time-token
 ```
 
 `install.ps1` best-effort installs **Python 3** and **Git for Windows** (for `bash`,
-which the provisioning scripts need) via `winget`, checks for **Docker Desktop**
-(WSL2 backend — install it manually if missing), and registers a **Scheduled Task**
-(SYSTEM at startup if elevated, else per-user at logon) that restarts on failure.
-Monitoring and RCON work without Docker; **hosting a server needs Docker Desktop + bash**.
+which the provisioning scripts need) via `winget`, and for the container engine it
+prefers **Podman** (free, CLI-only — **no Docker Desktop / no license**; it sets up a
+small WSL2-backed machine on first use). Docker or nerdctl are used instead if already
+present. It registers a **Scheduled Task** that runs **as you** (never SYSTEM, so it
+sees your Python/engine) — at startup without login when run elevated (S4U), otherwise
+at logon — and restarts on failure. Monitoring and RCON work without any engine;
+**hosting a server needs a container engine + bash**.
+
+The installer resolves an **absolute** `python.exe` and bakes it into the launcher, so
+it dodges two classic Windows traps: the Microsoft Store `python` stub (a no-op that
+opens the Store) and a freshly-installed Python not yet on `PATH`.
 
 ### Manual run (dev)
 

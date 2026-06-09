@@ -11,7 +11,7 @@ executes them locally:
 
 Config via env: CONTROL_URL (required), TOKEN (one-time, first run only),
 AGENT_STATE (cred file; default /etc/mc-spawn-agent/cred.json on Linux,
-%ProgramData%\\mc-spawn-agent\\cred.json on Windows).
+%LOCALAPPDATA%\\mc-spawn-agent\\cred.json on Windows).
 
 Cross-platform (Linux + Windows): paths, the script shell, and the playit container's
 networking adapt to the OS; MC hosting + RCON already work on both via port mapping
@@ -47,10 +47,10 @@ PLATFORM = f"{platform.system().lower()}/{(platform.machine() or '').lower()}"
 
 def _default_state_path():
     """Cred-file default. The installer always sets AGENT_STATE explicitly; this only
-    covers a bare manual run. Windows has no /etc, so use ProgramData (system) or
-    LOCALAPPDATA (per-user) — both writable without admin in the usual cases."""
+    covers a bare manual run. Windows has no /etc; the installer runs the agent as the
+    user (not SYSTEM), so prefer per-user LOCALAPPDATA (writable without admin)."""
     if IS_WINDOWS:
-        base = os.environ.get("ProgramData") or os.environ.get("LOCALAPPDATA") or os.getcwd()
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("ProgramData") or os.getcwd()
         return os.path.join(base, "mc-spawn-agent", "cred.json")
     return "/etc/mc-spawn-agent/cred.json"
 

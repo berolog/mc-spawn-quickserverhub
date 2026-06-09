@@ -36,10 +36,14 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   renders the full command (no forced `sudo`, piped to `sh`).
 - `install.ps1` — **Windows** PowerShell installer (Phase 6, parallel to `install.sh`). Reads
   `CONTROL_URL`/`TOKEN` from env (`irm … | iex`), best-effort installs Python 3 + Git-for-Windows
-  (for `bash`) via **winget**, verifies **Docker Desktop** is present/running (can't auto-install —
-  WSL2+reboot; links it), fetches `agent.py`, writes a user-ACL'd `run.cmd` launcher (carries the
-  env so the token isn't world-readable — the Win analogue of `chmod 600`), and registers a
-  **Scheduled Task** (no NSSM dep): SYSTEM @startup if admin, else per-user @logon; restart-on-fail.
+  (for `bash`) via **winget**, and for the engine **prefers Podman** (`RedHat.Podman` — free, CLI-
+  only, no Docker Desktop; auto `podman machine init/start`), falling back to an existing docker/
+  nerdctl or a warning. Resolves an **absolute real `python.exe`** (skips the MS-Store stub +
+  unrefreshed PATH — both were silent-failure bugs) and bakes it into a user-ACL'd `run.cmd`
+  launcher (carries the env so the token isn't world-readable — the Win analogue of `chmod 600`).
+  Registers a **Scheduled Task** (no NSSM dep) that runs **as the current user, never SYSTEM**
+  (so it sees the user's Python/engine): S4U @startup if admin (no login needed), else Interactive
+  @logon; restart-on-fail. Install dir is per-user `%LOCALAPPDATA%\mc-spawn-agent`.
 - `mc-spawn-agent.service` — reference systemd unit (install.sh generates the real
   one per backend; all exec `run.sh`).
 - `tests/test_agent.py` — pure: shell executor, `_execute` dispatch, RCON soft-error path,
@@ -205,9 +209,12 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
 
 > **Windows live-verify note (Phase 6):** the OS-aware helpers are unit-tested (by patching
 > `IS_WINDOWS`), but a real Windows box must confirm: (1) `install.ps1` winget installs + the
-> Scheduled-Task registration/restart behaviour; (2) the agent reaching `docker.exe` and running
-> the bot's POSIX scripts via Git-Bash; (3) playit forwarding to `host.docker.internal:<mc_port>` —
-> if playit's `local_ip` rejects a hostname, set `PLAYIT_LOCAL_IP` to the Docker-Desktop host IP.
+> Scheduled-Task registration runs **as the user** (S4U @startup / Interactive @logon) and actually
+> launches the agent — the prior SYSTEM task couldn't find the per-user Python, so it died silently;
+> (2) Podman: `winget install RedHat.Podman` + `podman machine init/start` succeeding (needs WSL2),
+> the agent reaching `podman.exe`, and the bot's POSIX scripts running via Git-Bash with
+> `$MCSPAWN_RT=podman`; (3) playit forwarding to `host.docker.internal:<mc_port>` (podman-on-WSL may
+> not provide that host alias → set `PLAYIT_LOCAL_IP` to the WSL/host IP).
 
 ## Run / test
 
