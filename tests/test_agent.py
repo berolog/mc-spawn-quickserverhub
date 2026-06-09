@@ -357,5 +357,86 @@ class MainReenrollTests(unittest.TestCase):
                 agent.main()
 
 
+class CrossPlatformTests(unittest.TestCase):
+    def test_shell_argv_posix_uses_bash(self):
+        with mock.patch.object(agent, "IS_WINDOWS", False), \
+             mock.patch.dict(agent.os.environ, {}, clear=False):
+            agent.os.environ.pop("AGENT_SHELL", None)
+            self.assertEqual(agent._shell_argv("x"), ["bash", "-c", "x"])
+
+    def test_shell_argv_windows_prefers_bash_when_present(self):
+        with mock.patch.object(agent, "IS_WINDOWS", True), \
+             mock.patch.object(agent.shutil, "which", return_value="C:/bash.exe"):
+            agent.os.environ.pop("AGENT_SHELL", None)
+            self.assertEqual(agent._shell_argv("x"), ["bash", "-c", "x"])
+
+    def test_shell_argv_windows_falls_back_to_cmd(self):
+        with mock.patch.object(agent, "IS_WINDOWS", True), \
+             mock.patch.object(agent.shutil, "which", return_value=None):
+            agent.os.environ.pop("AGENT_SHELL", None)
+            self.assertEqual(agent._shell_argv("x"), ["cmd", "/c", "x"])
+
+    def test_shell_argv_env_override_wins(self):
+        with mock.patch.dict(agent.os.environ, {"AGENT_SHELL": "zsh"}):
+            self.assertEqual(agent._shell_argv("x"), ["zsh", "-c", "x"])
+
+    def test_default_state_path_per_os(self):
+        with mock.patch.object(agent, "IS_WINDOWS", False):
+            self.assertEqual(agent._default_state_path(), "/etc/mc-spawn-agent/cred.json")
+        with mock.patch.object(agent, "IS_WINDOWS", True), \
+             mock.patch.dict(agent.os.environ, {"ProgramData": r"C:\ProgramData"}):
+            self.assertTrue(agent._default_state_path().endswith("cred.json"))
+            self.assertIn("mc-spawn-agent", agent._default_state_path())
+
+    def test_playit_networking_per_os(self):
+        with mock.patch.object(agent, "IS_WINDOWS", False):
+            agent.os.environ.pop("PLAYIT_LOCAL_IP", None)
+            self.assertEqual(agent._playit_local_ip(), "127.0.0.1")
+            self.assertEqual(agent._playit_net_args(), ["--network", "host"])
+        with mock.patch.object(agent, "IS_WINDOWS", True):
+            agent.os.environ.pop("PLAYIT_LOCAL_IP", None)
+            self.assertEqual(agent._playit_local_ip(), "host.docker.internal")
+            self.assertIn("host.docker.internal:host-gateway", agent._playit_net_args())
+
+    def test_playit_local_ip_env_override(self):
+        with mock.patch.dict(agent.os.environ, {"PLAYIT_LOCAL_IP": "10.0.0.5"}):
+            self.assertEqual(agent._playit_local_ip(), "10.0.0.5")
+
+
+class ProtocolNegotiationTests(unittest.TestCase):
+    def test_enroll_sends_protocol_and_platform(self):
+        captured = {}
+
+        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
+            captured["body"] = body
+            return 200, {"machine_id": 1, "secret": "s"}
+
+        with mock.patch.object(agent, "TOKEN", "tok"), \
+             mock.patch.object(agent, "_http", side_effect=fake_http), \
+             mock.patch.object(agent, "_save_state"):
+            agent._enroll()
+        self.assertEqual(captured["body"]["protocol_version"], agent.PROTOCOL_VERSION)
+        self.assertEqual(captured["body"]["platform"], agent.PLATFORM)
+
+    def test_http_attaches_protocol_and_platform_headers(self):
+        seen = {}
+
+        class FakeResp:
+            status = 200
+            def read(self): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None):
+            seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+            return FakeResp()
+
+        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
+             mock.patch.object(agent.urllib.request, "urlopen", side_effect=fake_urlopen):
+            agent._http("GET", "/poll", secret="s")
+        self.assertEqual(seen["headers"]["x-mc-spawn-protocol"], str(agent.PROTOCOL_VERSION))
+        self.assertEqual(seen["headers"]["x-mc-spawn-platform"], agent.PLATFORM)
+
+
 if __name__ == "__main__":
     unittest.main()

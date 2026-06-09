@@ -10,15 +10,22 @@ executes them locally:
              play address friends connect to (no inbound port opened on this box).
 
 Config via env: CONTROL_URL (required), TOKEN (one-time, first run only),
-AGENT_STATE (cred file, default /etc/mc-spawn-agent/cred.json).
+AGENT_STATE (cred file; default /etc/mc-spawn-agent/cred.json on Linux,
+%ProgramData%\mc-spawn-agent\cred.json on Windows).
+
+Cross-platform (Linux + Windows): paths, the script shell, and the playit container's
+networking adapt to the OS; MC hosting + RCON already work on both via port mapping
+(Docker Desktop publishes ports to the host's localhost). See install.sh / install.ps1.
 
 Thin by design: all Minecraft logic lives in the bot (mc-spawn-bot) — the agent is
 a small, auditable executor. This is the client half of the system and lives in its
 own repository so users can inspect exactly what they install; a Go rewrite can be a
-drop-in (same HTTP protocol).
+drop-in (same versioned HTTP protocol — PROTOCOL_VERSION).
 """
 import json
 import os
+import platform
+import shutil
 import socket
 import struct
 import subprocess
@@ -27,9 +34,30 @@ import time
 import urllib.error
 import urllib.request
 
+# Phase 6: the agent is cross-platform (Linux + Windows). os.name == "nt" on Windows.
+IS_WINDOWS = os.name == "nt"
+
+# Versioned control-plane contract (Phase 6): the agent advertises this on every
+# call so a future compiled (Go) binary can be a drop-in and the control plane can
+# negotiate. Bump ONLY on a breaking change to the /enroll·/poll·/result wire shapes.
+PROTOCOL_VERSION = 1
+# Coarse platform tag the control plane stores (e.g. "linux/x86_64", "windows/amd64").
+PLATFORM = f"{platform.system().lower()}/{(platform.machine() or '').lower()}"
+
+
+def _default_state_path():
+    """Cred-file default. The installer always sets AGENT_STATE explicitly; this only
+    covers a bare manual run. Windows has no /etc, so use ProgramData (system) or
+    LOCALAPPDATA (per-user) — both writable without admin in the usual cases."""
+    if IS_WINDOWS:
+        base = os.environ.get("ProgramData") or os.environ.get("LOCALAPPDATA") or os.getcwd()
+        return os.path.join(base, "mc-spawn-agent", "cred.json")
+    return "/etc/mc-spawn-agent/cred.json"
+
+
 CONTROL_URL = os.environ.get("CONTROL_URL", "").rstrip("/")
 TOKEN = os.environ.get("TOKEN", "").strip()
-STATE_PATH = os.environ.get("AGENT_STATE", "/etc/mc-spawn-agent/cred.json")
+STATE_PATH = os.environ.get("AGENT_STATE", _default_state_path())
 
 POLL_TIMEOUT = 40        # > server long-poll (25s)
 SHELL_TIMEOUT = 600      # provisioning (docker pull) can be slow
@@ -43,10 +71,28 @@ def _log(msg):
     print(f"[mc-spawn-agent] {msg}", flush=True)
 
 
+def _shell_argv(script):
+    """Pick the shell to run a bot-issued script. The bot emits POSIX `docker` one-
+    liners (see provisioner.py), so we need a POSIX shell. On Linux that's `bash`.
+    On Windows, Docker Desktop ships with WSL/Git-Bash so `bash` is normally on PATH —
+    prefer it; fall back to `cmd /c` only if there's genuinely no bash (the docker
+    commands themselves are largely shell-agnostic). Override with AGENT_SHELL."""
+    override = os.environ.get("AGENT_SHELL")
+    if override:
+        return [override, "-c", script]
+    if IS_WINDOWS and not shutil.which("bash"):
+        return ["cmd", "/c", script]
+    return ["bash", "-c", script]
+
+
 def _http(method, path, body=None, secret=None, timeout=POLL_TIMEOUT):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(CONTROL_URL + path, data=data, method=method)
     req.add_header("User-Agent", USER_AGENT)
+    # Versioned contract + platform (Phase 6) — cheap headers on every call so the
+    # control plane can negotiate/record without changing any response shape.
+    req.add_header("X-MC-Spawn-Protocol", str(PROTOCOL_VERSION))
+    req.add_header("X-MC-Spawn-Platform", PLATFORM)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     if secret:
@@ -84,7 +130,11 @@ def _enroll():
     if not TOKEN:
         _log("no stored creds and no TOKEN env — cannot enroll")
         return None
-    status, data = _http("POST", "/enroll", {"token": TOKEN}, timeout=20)
+    status, data = _http(
+        "POST", "/enroll",
+        {"token": TOKEN, "protocol_version": PROTOCOL_VERSION, "platform": PLATFORM},
+        timeout=20,
+    )
     if status != 200 or not data:
         _log(f"enroll failed (HTTP {status})")
         return None
@@ -98,7 +148,7 @@ def _enroll():
 def _run_shell(payload):
     try:
         p = subprocess.run(
-            ["bash", "-c", payload["script"]],
+            _shell_argv(payload["script"]),
             capture_output=True, text=True, timeout=SHELL_TIMEOUT,
         )
         return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]}
@@ -175,6 +225,28 @@ PLAYIT_KEY_PATH = os.path.join(os.path.dirname(STATE_PATH) or ".", "playit.key")
 # overridable via env. (The playit docker container itself reports its own real version once
 # it connects, but we may create the tunnel before that, so the claim version must be valid.)
 PLAYIT_VERSION = os.environ.get("PLAYIT_VERSION", "playit 1.0.9")
+
+
+def _playit_local_ip():
+    """Address the playit container uses to reach the local MC server's published port
+    (Phase 6, cross-platform). On Linux we run playit with `--network host`, so the
+    host loopback `127.0.0.1:<mc_port>` is correct. On Windows/macOS, Docker Desktop
+    runs containers in a Linux VM where `--network host` does NOT expose the host's
+    ports, so playit must reach the host via the Docker-Desktop alias
+    `host.docker.internal`. Override with PLAYIT_LOCAL_IP. (Live-verify on Windows.)"""
+    override = os.environ.get("PLAYIT_LOCAL_IP")
+    if override:
+        return override
+    return "127.0.0.1" if not IS_WINDOWS else "host.docker.internal"
+
+
+def _playit_net_args():
+    """Docker networking flags for the playit container per OS. Linux: host network.
+    Windows/macOS: bridge + a guaranteed `host.docker.internal` mapping so playit can
+    forward to the host-published MC port."""
+    if not IS_WINDOWS:
+        return ["--network", "host"]
+    return ["--add-host", "host.docker.internal:host-gateway"]
 
 
 def _playit_api(path, body, secret=None):
@@ -271,7 +343,7 @@ def _playit_create_tunnel(secret, agent_id, local_port):
         "port_type": "tcp",
         "port_count": 1,
         "origin": {"type": "agent", "data": {
-            "agent_id": agent_id, "local_ip": "127.0.0.1", "local_port": int(local_port)}},
+            "agent_id": agent_id, "local_ip": _playit_local_ip(), "local_port": int(local_port)}},
         "enabled": True,
         "alloc": None,
         "firewall_id": None,
@@ -332,7 +404,7 @@ def _playit_run(secret):
                        capture_output=True, text=True, timeout=30)
         return subprocess.run(
             ["docker", "run", "-d", "--name", PLAYIT_CONTAINER, "--restart", "unless-stopped",
-             "--network", "host", "-e", "SECRET_KEY=" + secret, PLAYIT_IMAGE],
+             *_playit_net_args(), "-e", "SECRET_KEY=" + secret, PLAYIT_IMAGE],
             capture_output=True, text=True, timeout=120,
         ).returncode == 0
     except Exception:  # noqa: BLE001

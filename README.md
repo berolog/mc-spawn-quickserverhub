@@ -68,6 +68,21 @@ sets this up when it can and warns otherwise.
 Override `AGENT_RAW` to install from a fork or a pinned commit. Pipe to `bash`
 instead of `sh` if you prefer — the script is POSIX `sh` either way.
 
+### Windows
+
+The bot gives you the PowerShell equivalent — run it in **PowerShell**:
+
+```powershell
+$env:CONTROL_URL='https://agent.quickserverhub.com'; $env:TOKEN='<one-time-token>'; `
+  irm https://raw.githubusercontent.com/berolog/mc-spawn-quickserverhub/main/install.ps1 | iex
+```
+
+`install.ps1` best-effort installs **Python 3** and **Git for Windows** (for `bash`,
+which the provisioning scripts need) via `winget`, checks for **Docker Desktop**
+(WSL2 backend — install it manually if missing), and registers a **Scheduled Task**
+(SYSTEM at startup if elevated, else per-user at logon) that restarts on failure.
+Monitoring and RCON work without Docker; **hosting a server needs Docker Desktop + bash**.
+
 ### Manual run (dev)
 
 ```bash
