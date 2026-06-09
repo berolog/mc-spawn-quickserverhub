@@ -123,6 +123,20 @@ python3 -m unittest discover -v tests
 
 Pure, no network: shell executor, command dispatch, RCON soft-error path.
 
+## Reliability & idempotency
+
+- **Any container engine.** Auto-detects `docker → podman → nerdctl` (override with
+  `CONTAINER_RUNTIME`); the installer installs docker only if none is present.
+- **Auto-reconnect.** The poll loop backs off and retries through network blips, control-
+  plane restarts (5xx) and edge errors; a rejected secret triggers one re-enroll if a
+  fresh `TOKEN` is set, else a clean exit.
+- **Self-healing servers.** The bot keeps each server at its desired state — a manually
+  stopped/removed container is restarted or recreated (the world volume is reattached);
+  a removed playit container is brought back. An intentional "stop" in the bot is honoured.
+- **Self-heal + clean uninstall.** A deleted `agent.py` is re-fetched on the next restart;
+  deleting the machine in the bot fully removes containers, playit, the service, and the
+  agent's own files.
+
 ## Security posture
 
 - **No inbound ports**, NAT-friendly; only outbound HTTPS to `CONTROL_URL`.

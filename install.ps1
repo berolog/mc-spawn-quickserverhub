@@ -74,14 +74,17 @@ if (-not (Have bash)) {
     Warn 'bash not found — monitoring/RCON will work, but provisioning a server needs bash (install Git for Windows or enable WSL).'
 }
 
-# Docker — required to actually host a server. Can't auto-install (WSL2 + reboot),
-# so verify and link.
-if (-not (Have docker)) {
-    Warn 'Docker not found — install Docker Desktop (WSL2 backend) to host a server: https://www.docker.com/products/docker-desktop/'
-} elseif (-not (docker info 2>$null)) {
-    Warn 'Docker is installed but not running — start Docker Desktop before hosting a server.'
+# Container engine — required to actually host a server. docker/podman/nerdctl all
+# work (the agent auto-detects via $MCSPAWN_RT). Can't auto-install Docker Desktop
+# (WSL2 + reboot), so verify and link.
+if (Have docker) {
+    if (-not (docker info 2>$null)) {
+        Warn 'Docker is installed but not running — start Docker Desktop before hosting a server.'
+    } else { Log 'docker present' }
+} elseif ((Have podman) -or (Have nerdctl)) {
+    Log 'container engine present (podman/nerdctl)'
 } else {
-    Log 'docker present'
+    Warn 'No container engine found — install Docker Desktop (WSL2 backend) to host a server: https://www.docker.com/products/docker-desktop/'
 }
 
 # ---- fetch agent.py ----
@@ -99,6 +102,8 @@ $CredPath = Join-Path $State 'cred.json'
 set "CONTROL_URL=$ControlUrl"
 set "TOKEN=$Token"
 set "AGENT_STATE=$CredPath"
+rem Self-heal (Phase 6.5): re-fetch agent.py if the user deleted it by hand.
+if not exist "$($Dir)\agent.py" powershell -NoProfile -Command "irm '$AgentRaw/agent.py' -OutFile '$($Dir)\agent.py'"
 "$Python" "$($Dir)\agent.py"
 "@ | Set-Content -Path $Run -Encoding ASCII
 

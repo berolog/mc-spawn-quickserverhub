@@ -93,11 +93,14 @@ ensure_cmd python3 python3
 # (Alpine has none by default).
 ensure_cmd bash bash
 
-# Docker — needed to provision the Minecraft server. Best-effort: prefer the
-# distro package; fall back to get.docker.com only if that fails and we can root.
+# Container engine — needed to provision the Minecraft server. docker/podman/nerdctl
+# all work (the agent auto-detects via $MCSPAWN_RT): if ANY is present we install
+# nothing; otherwise install docker (the most universal default). Best-effort: prefer
+# the distro package; fall back to get.docker.com only if that fails and we can root.
 setup_docker() {
-  if command -v docker >/dev/null 2>&1; then
-    log "docker present"
+  if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1 \
+     || command -v nerdctl >/dev/null 2>&1; then
+    log "container engine present"
   elif [ -n "$PM" ] && can_escalate; then
     if ! pm_install "$(pkgname docker)"; then
       warn "distro docker package failed; trying get.docker.com"
@@ -147,6 +150,12 @@ cat > "$RUN" <<EOF
 export CONTROL_URL="$CONTROL_URL"
 export TOKEN="$TOKEN"
 export AGENT_STATE="$STATE/cred.json"
+# Self-heal (Phase 6.5): if the user deleted agent.py by hand, re-fetch it before
+# launch so the service recovers on its next restart instead of crash-looping.
+if [ ! -f "$DIR/agent.py" ]; then
+  if command -v curl >/dev/null 2>&1; then curl -fsSL "$AGENT_RAW/agent.py" -o "$DIR/agent.py"
+  else wget -qO "$DIR/agent.py" "$AGENT_RAW/agent.py"; fi
+fi
 exec python3 "$DIR/agent.py"
 EOF
 chmod 0700 "$RUN"

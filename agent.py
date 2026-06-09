@@ -11,7 +11,7 @@ executes them locally:
 
 Config via env: CONTROL_URL (required), TOKEN (one-time, first run only),
 AGENT_STATE (cred file; default /etc/mc-spawn-agent/cred.json on Linux,
-%ProgramData%\mc-spawn-agent\cred.json on Windows).
+%ProgramData%\\mc-spawn-agent\\cred.json on Windows).
 
 Cross-platform (Linux + Windows): paths, the script shell, and the playit container's
 networking adapt to the OS; MC hosting + RCON already work on both via port mapping
@@ -69,6 +69,29 @@ USER_AGENT = "mc-spawn-agent/1.0"
 
 def _log(msg):
     print(f"[mc-spawn-agent] {msg}", flush=True)
+
+
+_RUNTIME_CACHE = None
+
+
+def _runtime():
+    """The container engine to use (Phase 6.5). Auto-detect `docker → podman → nerdctl`
+    on PATH; `CONTAINER_RUNTIME` env overrides. Cached. All three share the run/-p/-v/
+    start/stop/rm/logs/inspect surface the bot's scripts use, so the engine is a drop-in.
+    Defaults to `docker` if none is found (so an absent engine still produces sensible
+    error output rather than crashing here). The bot's scripts read it via `$MCSPAWN_RT`;
+    the agent's own playit commands call this directly."""
+    global _RUNTIME_CACHE
+    if _RUNTIME_CACHE is not None:
+        return _RUNTIME_CACHE
+    override = os.environ.get("CONTAINER_RUNTIME", "").strip()
+    if override:
+        _RUNTIME_CACHE = override
+    else:
+        _RUNTIME_CACHE = next(
+            (rt for rt in ("docker", "podman", "nerdctl") if shutil.which(rt)), "docker"
+        )
+    return _RUNTIME_CACHE
 
 
 def _shell_argv(script):
@@ -147,9 +170,13 @@ def _enroll():
 
 def _run_shell(payload):
     try:
+        # Expose the detected container engine to the bot's POSIX scripts as $MCSPAWN_RT
+        # (they call `${MCSPAWN_RT:-docker} …`), so one script set runs on docker/podman/
+        # nerdctl without the bot knowing what's installed on the box (Phase 6.5).
+        env = {**os.environ, "MCSPAWN_RT": _runtime()}
         p = subprocess.run(
             _shell_argv(payload["script"]),
-            capture_output=True, text=True, timeout=SHELL_TIMEOUT,
+            capture_output=True, text=True, timeout=SHELL_TIMEOUT, env=env,
         )
         return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]}
     except subprocess.TimeoutExpired:
@@ -385,7 +412,7 @@ def _playit_teardown():
     if secret:
         _playit_delete_tunnels(secret)
     try:
-        subprocess.run(["docker", "rm", "-f", PLAYIT_CONTAINER],
+        subprocess.run([_runtime(), "rm", "-f", PLAYIT_CONTAINER],
                        capture_output=True, text=True, timeout=30)
     except Exception:  # noqa: BLE001
         pass
@@ -400,10 +427,11 @@ def _playit_run(secret):
     (so it reaches 127.0.0.1:<mc_port>). Idempotent; never raises (docker may be
     absent) — returns False on any failure so the playit op stays soft."""
     try:
-        subprocess.run(["docker", "rm", "-f", PLAYIT_CONTAINER],
+        rt = _runtime()
+        subprocess.run([rt, "rm", "-f", PLAYIT_CONTAINER],
                        capture_output=True, text=True, timeout=30)
         return subprocess.run(
-            ["docker", "run", "-d", "--name", PLAYIT_CONTAINER, "--restart", "unless-stopped",
+            [rt, "run", "-d", "--name", PLAYIT_CONTAINER, "--restart", "unless-stopped",
              *_playit_net_args(), "-e", "SECRET_KEY=" + secret, PLAYIT_IMAGE],
             capture_output=True, text=True, timeout=120,
         ).returncode == 0
@@ -509,6 +537,84 @@ def _playit(payload):
     return {"status": "error", "error": f"unknown playit op {op}"}
 
 
+# ---- full self-uninstall (Phase 6.5) ----
+#
+# When the user deletes the machine in the bot, the agent removes EVERYTHING it put on
+# the box and then itself: MC containers + their world volumes, the playit container +
+# tunnels, the service/Scheduled-Task, and its own files. Containers + playit are torn
+# down synchronously (reliable); the service + files are removed by a DETACHED helper
+# so it survives the agent's own death when the service is stopped (and, on Windows,
+# can delete agent.py which is locked while running). Best-effort + idempotent.
+
+SERVICE_NAME = "mc-spawn-agent"
+
+
+def _uninstall(payload):
+    rt = _runtime()
+    for c in payload.get("containers", []):
+        for args in ([rt, "rm", "-f", c], [rt, "volume", "rm", f"{c}_data"]):
+            try:
+                subprocess.run(args, capture_output=True, text=True, timeout=60)
+            except Exception:  # noqa: BLE001
+                pass
+    _playit_teardown()
+    try:
+        _spawn_self_cleanup()
+    except Exception as e:  # noqa: BLE001
+        return {"status": "ok", "self_cleanup": f"deferred-failed:{type(e).__name__}"}
+    return {"status": "ok"}
+
+
+def _agent_paths():
+    """Files/dirs the installer created (best-effort; mirrors install.sh/.ps1)."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    state_dir = os.path.dirname(STATE_PATH) or "."
+    return d, state_dir
+
+
+def _spawn_self_cleanup():
+    """Launch a detached process that removes the service + agent files a few seconds
+    later — long enough for the result POST to land. Detached (new session / transient
+    unit) so stopping our own service doesn't kill it mid-cleanup."""
+    d, state_dir = _agent_paths()
+    if IS_WINDOWS:
+        # schtasks delete is synchronous-safe; the file delete waits out the lock on the
+        # running agent.py, then removes the dir tree.
+        ps = (
+            f"Start-Sleep 5; "
+            f"schtasks /delete /tn {SERVICE_NAME} /f 2>$null; "
+            f"Remove-Item -Recurse -Force '{d}','{state_dir}' -ErrorAction SilentlyContinue"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-Command", ps],
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0),
+        )
+        return
+    # POSIX: disable+stop whichever init backend exists, drop the @reboot cron line, then
+    # remove our files. Each step best-effort. Run via setsid so the service-stop's
+    # process-group/cgroup teardown doesn't take this script with it.
+    script = f"""sleep 5
+systemctl disable --now {SERVICE_NAME} 2>/dev/null; rm -f /etc/systemd/system/{SERVICE_NAME}.service 2>/dev/null; systemctl daemon-reload 2>/dev/null
+systemctl --user disable --now {SERVICE_NAME} 2>/dev/null; rm -f "$HOME/.config/systemd/user/{SERVICE_NAME}.service" 2>/dev/null; systemctl --user daemon-reload 2>/dev/null
+rc-update del {SERVICE_NAME} default 2>/dev/null; rc-service {SERVICE_NAME} stop 2>/dev/null; rm -f /etc/init.d/{SERVICE_NAME} 2>/dev/null
+(crontab -l 2>/dev/null | grep -v {SERVICE_NAME}) | crontab - 2>/dev/null
+rm -rf "{d}" "{state_dir}" 2>/dev/null
+"""
+    # Prefer systemd-run (transient unit in its own cgroup → immune to our service's
+    # cgroup kill); fall back to a new-session sh if it isn't available.
+    if shutil.which("systemd-run"):
+        subprocess.Popen(
+            ["systemd-run", "--collect", "--unit", f"{SERVICE_NAME}-uninstall", "/bin/sh", "-c", script],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        subprocess.Popen(
+            ["/bin/sh", "-c", script], start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+
 def _execute(cmd):
     kind, payload = cmd["kind"], cmd["payload"]
     if kind == "shell":
@@ -517,6 +623,8 @@ def _execute(cmd):
         return "done", _rcon(payload)
     if kind == "playit":
         return "done", _playit(payload)
+    if kind == "uninstall":
+        return "done", _uninstall(payload)
     return "failed", {"error": f"unknown kind {kind}"}
 
 
@@ -536,6 +644,11 @@ def main():
             if status == 200 and cmd:
                 st, res = _execute(cmd)
                 _http("POST", "/result", {"id": cmd["id"], "status": st, "result": res}, secret=secret)
+                if cmd.get("kind") == "uninstall":
+                    # We've reported the result and kicked off the detached self-cleanup;
+                    # exit so the (about-to-be-removed) service doesn't relaunch us.
+                    _log("uninstalled; exiting")
+                    sys.exit(0)
             elif status in (200, 204):
                 pass  # no command this cycle
             elif status == 401:
@@ -550,6 +663,15 @@ def main():
                     _log("re-enroll failed (need a fresh TOKEN from the bot); stopping")
                     sys.exit(1)
                 secret = new_secret
+            else:
+                # 5xx / unexpected status — the control plane is restarting or a
+                # Cloudflare edge blip; back off instead of hammering at backoff=1
+                # (which would spin a tight loop against a 502). Auto-reconnects once
+                # the control plane is healthy again (Phase 6.5).
+                _log(f"poll got HTTP {status}; retry in {backoff}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
             backoff = 1
         except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
             _log(f"poll error ({type(e).__name__}); retry in {backoff}s")

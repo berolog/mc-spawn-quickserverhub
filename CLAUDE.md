@@ -19,14 +19,16 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   `_playit` (granular per-port ops; tunnels named per local port via `_tunnel_name`). **Cross-
   platform (Phase 6):** `IS_WINDOWS`, `_default_state_path` (Win → `%ProgramData%`), `_playit_net_args`/
   `_playit_local_ip` (host-net+127.0.0.1 on Linux; `host.docker.internal` on Win/mac Docker
-  Desktop). Talks to `CONTROL_URL` via `_http`, which stamps `X-MC-Spawn-Protocol`
-  (`PROTOCOL_VERSION`) + `X-MC-Spawn-Platform` on every call. No third-party deps — a Go rewrite
-  is a drop-in behind the same versioned HTTP protocol.
+  Desktop). **Phase 6.5:** `_runtime()` (engine auto-detect → `$MCSPAWN_RT`), 5xx backoff in the
+  poll loop, and `_uninstall`/`_spawn_self_cleanup` (full self-removal). Talks to `CONTROL_URL` via
+  `_http`, which stamps `X-MC-Spawn-Protocol` (`PROTOCOL_VERSION`) + `X-MC-Spawn-Platform` on every
+  call. No third-party deps — a Go rewrite is a drop-in behind the same versioned HTTP protocol.
 - `install.sh` — **portable POSIX-`sh`** one-liner installer (runs under Alpine's
   busybox ash, not just bash). Reads `CONTROL_URL`/`TOKEN` from env, **detects the
   distro package manager** (apt/dnf/yum/pacman/apk/zypper) and installs whatever is
-  missing (`python3`, `bash`, `docker`), fetches `agent.py` from `AGENT_RAW`, writes
-  a 0600 `run.sh` launcher (carries the env so secrets stay out of unit files/`ps`),
+  missing (`python3`, `bash`, a container engine — skips if docker/podman/nerdctl already
+  exists), fetches `agent.py` from `AGENT_RAW`, writes a 0600 `run.sh` launcher (carries the
+  env so secrets stay out of unit files/`ps`; **re-fetches `agent.py` if deleted** — inv. 13),
   and registers a service via the available init: **systemd system** (root), **OpenRC**
   (root, Alpine), **systemd --user** (rootless), else a **nohup + `@reboot` crontab**
   fallback. Escalates with `sudo` ONLY when a missing package needs root — present
@@ -76,8 +78,10 @@ breaking wire change and update both repos together.
 | `POST /result` | Bearer | `{id, status, result}` |
 | `POST /heartbeat` | Bearer | — |
 
-Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}`; `rcon`
-`{rcon_port, password, command}` → `{ok, text}`; `playit` `{op, local_port, ...}` → `{status, ...}`.
+Command `kind`s: `shell` `{script}` → `{exit, stdout, stderr}` (the engine is exposed to
+the script as `$MCSPAWN_RT`, see inv. 12); `rcon` `{rcon_port, password, command}` →
+`{ok, text}`; `playit` `{op, local_port, ...}` → `{status, ...}`; `uninstall` `{containers}`
+→ `{status:"ok"}` then the agent self-removes and exits (inv. 13).
 
 ### `playit` ops (public play address)
 
@@ -173,6 +177,23 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
     The control plane stores `platform`/`protocol_version` on the machine row. This freezes the
     contract so a future Go/compiled agent is a drop-in and the bot can branch on platform if ever
     needed. **Bump `PROTOCOL_VERSION` only on a breaking wire change, and update both repos together.**
+12. **Engine-agnostic; idempotent; auto-reconnect (Phase 6.5).** `_runtime()` auto-detects the
+    container engine (`docker → podman → nerdctl`, `CONTAINER_RUNTIME` overrides) and is exported to
+    every bot script as `$MCSPAWN_RT` (so the bot's `provisioner.py` commands stay engine-agnostic);
+    the agent's own playit commands call `_runtime()` directly. The poll loop now **backs off on 5xx/
+    unexpected** statuses too (not just network errors), so a control-plane restart or CF blip is
+    ridden out instead of hammered. **The agent stays a dumb executor** — it does NOT decide what
+    should run; the bot's reconciler pushes `start`/recreate/`playit_start` to close drift, and the
+    recreate reattaches the `<container>_data` volume so the world survives a manual `docker rm`.
+13. **Full self-uninstall on machine delete.** The `uninstall` `{containers}` command purges the
+    listed MC containers + their `_data` volumes and tears down playit **synchronously**, then spawns
+    a **detached** cleanup (systemd-run / new-session `sh`, or PowerShell on Windows) that removes the
+    service/Scheduled-Task + the agent's own files a few seconds later — surviving the agent's death
+    when its service is stopped (and the agent.py file-lock on Windows). The agent reports the result
+    then `sys.exit(0)` so the (being-removed) service doesn't relaunch it. Best-effort + idempotent.
+    The launchers (`run.sh`/`run.cmd`) **re-fetch `agent.py` from `AGENT_RAW` if it was deleted**, so
+    a manually-removed binary self-heals on the next service restart. **Live-verify:** service removal
+    + Windows Scheduled-Task delete need a real box (the cgroup/file-lock timing is the unproven bit).
 
 > **Live-verify note:** the playit claim handshake + tunnel create/delete/address read can
 > only be fully confirmed on a real box with a real playit account — not in CI. Verified

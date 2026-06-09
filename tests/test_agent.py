@@ -292,6 +292,64 @@ class RconErrorPathTests(unittest.TestCase):
         self.assertIn("RCON", res["text"])
 
 
+class UninstallTests(unittest.TestCase):
+    def test_uninstall_purges_containers_teardowns_playit_and_spawns_cleanup(self):
+        runs = []
+        with mock.patch.object(agent, "_runtime", return_value="docker"), \
+             mock.patch.object(agent.subprocess, "run",
+                               side_effect=lambda a, **k: runs.append(a)), \
+             mock.patch.object(agent, "_playit_teardown") as teardown, \
+             mock.patch.object(agent, "_spawn_self_cleanup") as cleanup:
+            res = agent._uninstall({"containers": ["mcw-1", "mcw-2"]})
+        self.assertEqual(res["status"], "ok")
+        teardown.assert_called_once()
+        cleanup.assert_called_once()
+        # each container: rm -f + volume rm
+        self.assertIn(["docker", "rm", "-f", "mcw-1"], runs)
+        self.assertIn(["docker", "volume", "rm", "mcw-1_data"], runs)
+        self.assertIn(["docker", "rm", "-f", "mcw-2"], runs)
+
+    def test_execute_dispatches_uninstall(self):
+        with mock.patch.object(agent, "_uninstall", return_value={"status": "ok"}) as u:
+            st, res = agent._execute({"kind": "uninstall", "payload": {"containers": []}})
+        self.assertEqual((st, res["status"]), ("done", "ok"))
+        u.assert_called_once()
+
+    def test_self_cleanup_posix_setsid_script_targets_all_backends(self):
+        popen = []
+        with mock.patch.object(agent, "IS_WINDOWS", False), \
+             mock.patch.object(agent.shutil, "which", return_value=None), \
+             mock.patch.object(agent.subprocess, "Popen",
+                               side_effect=lambda *a, **k: popen.append((a, k))):
+            agent._spawn_self_cleanup()
+        (argv,), kwargs = popen[0]
+        self.assertEqual(argv[0], "/bin/sh")
+        self.assertTrue(kwargs.get("start_new_session"))
+        script = argv[2]
+        for needle in ("systemctl disable --now", "rc-update del", "crontab", "rm -rf"):
+            self.assertIn(needle, script)
+
+    def test_self_cleanup_prefers_systemd_run_when_present(self):
+        popen = []
+        with mock.patch.object(agent, "IS_WINDOWS", False), \
+             mock.patch.object(agent.shutil, "which", return_value="/usr/bin/systemd-run"), \
+             mock.patch.object(agent.subprocess, "Popen",
+                               side_effect=lambda *a, **k: popen.append((a, k))):
+            agent._spawn_self_cleanup()
+        argv = popen[0][0][0]
+        self.assertEqual(argv[0], "systemd-run")
+
+    def test_self_cleanup_windows_uses_schtasks_via_powershell(self):
+        popen = []
+        with mock.patch.object(agent, "IS_WINDOWS", True), \
+             mock.patch.object(agent.subprocess, "Popen",
+                               side_effect=lambda *a, **k: popen.append((a, k))):
+            agent._spawn_self_cleanup()
+        argv = popen[0][0][0]
+        self.assertEqual(argv[0], "powershell")
+        self.assertIn("schtasks /delete", " ".join(argv))
+
+
 class _Stop(Exception):
     """Sentinel to break main()'s infinite poll loop in tests (it is not one of the
     network errors main catches, so it propagates straight out)."""
@@ -342,6 +400,25 @@ class MainReenrollTests(unittest.TestCase):
                 agent.main()
         enroll.assert_called_once()
         self.assertEqual(polls, ["old", "new"])  # adopted the re-enrolled secret
+
+    def test_5xx_backs_off_instead_of_hammering(self):
+        seq = [503]
+
+        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
+            if path == "/poll":
+                if seq:
+                    return seq.pop(0), None  # control plane restarting
+                raise _Stop                  # end the loop on the retry
+            raise AssertionError(f"unexpected call to {path}")
+
+        slept = []
+        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
+             mock.patch.object(agent, "_load_state", return_value={"machine_id": 1, "secret": "s"}), \
+             mock.patch.object(agent, "_http", side_effect=fake_http), \
+             mock.patch.object(agent.time, "sleep", side_effect=lambda s: slept.append(s)):
+            with self.assertRaises(_Stop):
+                agent.main()
+        self.assertTrue(slept)  # backed off on the 503 rather than spinning
 
     def test_401_exits_when_reenroll_fails(self):
         def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
