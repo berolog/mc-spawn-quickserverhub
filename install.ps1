@@ -224,17 +224,26 @@ function Setup-WslHosting {
         return
     }
 
-    $have = @(& wsl -l -q | ForEach-Object { $_.Trim() }) -contains $WslDistro
-    if ($have) {
-        & wsl -d $WslDistro -- sh -lc 'service docker start >/dev/null 2>&1; docker info >/dev/null 2>&1'
-        if ($LASTEXITCODE -eq 0) { Log "WSL hosting ready (distro '$WslDistro')"; return }
-    } else {
-        Log "creating the '$WslDistro' WSL distro (downloads the Ubuntu 24.04 WSL rootfs)…"
+    # Ensure a BOOTABLE distro. A registered distro whose files were deleted by hand (e.g.
+    # removing %LOCALAPPDATA%\mc-spawn-agent\wsl\ without `wsl --unregister`) still shows in
+    # `wsl -l` but can't attach its vhdx (ERROR_PATH_NOT_FOUND) — detect that and re-create.
+    $listed = @(& wsl -l -q | ForEach-Object { $_.Trim() }) -contains $WslDistro
+    if ($listed) {
+        & wsl -d $WslDistro -- true 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Log "existing '$WslDistro' distro won't boot (stale registration) — re-creating it…"
+            & wsl --unregister $WslDistro 2>&1 | Out-Null
+            $listed = $false
+        }
+    }
+    if (-not $listed) {
+        Log "creating the '$WslDistro' WSL distro (downloads the Ubuntu 24.04 WSL rootfs, ~340MB)…"
         $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
         $rootfsUrl = if ($env:MCSPAWN_WSL_ROOTFS_URL) { $env:MCSPAWN_WSL_ROOTFS_URL } `
                      else { "https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-$arch-wsl.rootfs.tar.gz" }
         $tar = Join-Path $Dir 'distro-rootfs.tar.gz'
         $distroDir = Join-Path $Dir 'wsl'
+        Remove-Item -Recurse -Force $distroDir -ErrorAction SilentlyContinue   # clear any stale vhdx
         New-Item -ItemType Directory -Force -Path $distroDir | Out-Null
         try {
             Invoke-WebRequest -UseBasicParsing -Uri $rootfsUrl -OutFile $tar
