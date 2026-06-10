@@ -182,7 +182,7 @@ def _enroll():
     whether that is fatal. The enroll token is single-use (consumed server-side on
     success), so a repeat attempt with a stale/used token correctly returns None."""
     if not TOKEN:
-        _log("no stored creds and no TOKEN env — cannot enroll")
+        _log("no stored creds and no TOKEN env - cannot enroll")
         return None
     status, data = _http(
         "POST", "/enroll",
@@ -705,7 +705,7 @@ def main():
                 # unused TOKEN is present — then we adopt the new secret and carry on.
                 # Otherwise exit so the operator re-pairs, instead of crash-looping
                 # a poll the secret can never satisfy.
-                _log("unauthorized — secret rejected; attempting re-enroll")
+                _log("unauthorized - secret rejected; attempting re-enroll")
                 new_secret = _enroll()
                 if not new_secret:
                     _log("re-enroll failed (need a fresh TOKEN from the bot); stopping")
