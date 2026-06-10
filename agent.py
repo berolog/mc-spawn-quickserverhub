@@ -155,12 +155,17 @@ def _ensure_engine_ready():
     if not IS_WINDOWS:
         return
     try:
+        # Start dockerd and wait for its socket (it takes a few seconds), so the very next
+        # container command doesn't race a not-yet-listening daemon. Exits 0 once `docker
+        # info` succeeds, non-zero if it never comes up.
+        wait = ("service docker start >/dev/null 2>&1; "
+                "for i in $(seq 1 30); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1")
         r = subprocess.run(
-            ["wsl", "-d", WSL_DISTRO, "--", "sh", "-lc", "service docker start 2>&1 || true"],
+            ["wsl", "-d", WSL_DISTRO, "--", "sh", "-lc", wait],
             capture_output=True, text=True, timeout=180)
         out = (r.stdout or r.stderr or "").strip()
         if r.returncode == 0:
-            _debug(f"wsl '{WSL_DISTRO}' docker start: {out[-200:]!r}")
+            _debug(f"wsl '{WSL_DISTRO}' docker ready")
         else:
             # Most likely the distro doesn't exist yet — hosting needs the installer's
             # `wsl --import` + docker setup to have run.

@@ -254,17 +254,28 @@ function Setup-WslHosting {
     Log 'installing Docker inside the distro (one-time)…'
     # iptables-legacy: dockerd can't program nftables on the WSL2 kernel (a well-known
     # gotcha), so containers would get no networking — switch to legacy before starting.
+    # Capture output (don't swallow) so a failure shows WHY.
     $setup = 'export DEBIAN_FRONTEND=noninteractive; ' +
-             'command -v docker >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq docker.io iptables; }; ' +
-             'update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 || true; ' +
-             'update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 || true; ' +
-             'printf ''[boot]\ncommand=service docker start\n'' > /etc/wsl.conf; ' +
-             'service docker start >/dev/null 2>&1 || true'
-    & wsl -d $WslDistro -- sh -lc $setup 2>&1 | Out-Null
+             'if ! command -v docker >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io iptables; fi; ' +
+             'update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true; ' +
+             'update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true; ' +
+             'printf ''[boot]\ncommand=service docker start\n'' > /etc/wsl.conf'
+    $setupOut = & wsl -d $WslDistro -- sh -lc $setup 2>&1
     & wsl --terminate $WslDistro 2>&1 | Out-Null   # apply /etc/wsl.conf boot command
-    & wsl -d $WslDistro -- sh -lc 'service docker start >/dev/null 2>&1; docker info >/dev/null 2>&1'
-    if ($LASTEXITCODE -eq 0) { Log "WSL hosting ready (distro '$WslDistro')" }
-    else { Warn "Docker did not come up in '$WslDistro' — re-run the installer, or check: wsl -d $WslDistro -- docker info" }
+
+    # Start dockerd and WAIT for it — the daemon needs a few seconds to open its socket,
+    # so a single immediate `docker info` would false-negative. On failure, print the real
+    # error (the trailing `docker info` + `exit 1`) so it's diagnosable, not a vague warning.
+    $verify = 'service docker start >/dev/null 2>&1; ' +
+              'for i in $(seq 1 30); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; ' +
+              'echo "=== docker did not start ==="; docker info 2>&1 | tail -n 25; exit 1'
+    $out = & wsl -d $WslDistro -- sh -lc $verify 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Log "WSL hosting ready (distro '$WslDistro')"
+    } else {
+        Warn "Docker did not come up in '$WslDistro'. Details below; re-run the installer or inspect with: wsl -d $WslDistro -- sh -lc 'service docker start; docker info'"
+        @($setupOut + $out | Select-Object -Last 30) | ForEach-Object { Warn "  $_" }
+    }
 }
 
 try { Setup-WslHosting } catch { Warn "WSL hosting setup error: $($_.Exception.Message)" }
