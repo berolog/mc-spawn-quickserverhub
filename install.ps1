@@ -14,6 +14,11 @@
 # (`wsl --install` + reboot) — a Windows security boundary we can't bypass.
 
 $ErrorActionPreference = 'Stop'
+# Don't let a NON-zero exit (or stderr) of a native command (wsl/winget/icacls) throw —
+# we check $LASTEXITCODE explicitly where it matters. PS 7.4+ defaults this to $true,
+# which otherwise turns a benign `docker info` failure into a fatal exception. (Harmless
+# no-op on Windows PowerShell 5.1, where the variable simply doesn't exist.)
+$PSNativeCommandUseErrorActionPreference = $false
 
 function Log  ($m) { Write-Host    "[mc-spawn-agent] $m" }
 function Warn ($m) { Write-Warning "[mc-spawn-agent] $m" }
@@ -215,6 +220,17 @@ function Wsl-Enabled {
     return ($LASTEXITCODE -eq 0)
 }
 
+function Wsl-RunScript($scriptText) {
+    # Run a multi-line script in the distro via a FILE on /mnt/c — this sidesteps the
+    # arg-quoting / word-splitting / UTF-16 pitfalls of inline `wsl -- sh -lc "<one big
+    # string>"` (which mangled a `for … do … done` into a syntax error). Written LF, no BOM
+    # (bash chokes on CRLF). Returns the combined output; $LASTEXITCODE = the script's exit.
+    $f = Join-Path $Dir 'wsl-task.sh'
+    [IO.File]::WriteAllText($f, ($scriptText -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
+    $mnt = '/mnt/' + $Dir.Substring(0,1).ToLower() + ($Dir.Substring(2) -replace '\\','/') + '/wsl-task.sh'
+    return (& wsl -d $WslDistro -- bash $mnt 2>&1)
+}
+
 function Setup-WslHosting {
     if (-not (Wsl-Enabled)) { & wsl --update 2>&1 | Out-Null }   # best-effort kernel update
     if (-not (Wsl-Enabled)) {
@@ -260,29 +276,34 @@ function Setup-WslHosting {
 
     # Install Docker inside the distro (root → no admin, no password) and make it start on
     # every distro boot via /etc/wsl.conf (no systemd dependency). Then restart + verify.
-    Log 'installing Docker inside the distro (one-time)…'
     # iptables-legacy: dockerd can't program nftables on the WSL2 kernel (a well-known
     # gotcha), so containers would get no networking — switch to legacy before starting.
-    # Capture output (don't swallow) so a failure shows WHY.
-    $setup = 'export DEBIAN_FRONTEND=noninteractive; ' +
-             'if ! command -v docker >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io iptables; fi; ' +
-             'update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true; ' +
-             'update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true; ' +
-             'printf ''[boot]\ncommand=service docker start\n'' > /etc/wsl.conf'
-    $setupOut = & wsl -d $WslDistro -- sh -lc $setup 2>&1
+    Log 'installing Docker inside the distro (one-time)…'
+    $setupOut = Wsl-RunScript @'
+set -e
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v docker >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io iptables; fi
+update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
+printf '[boot]\ncommand=service docker start\n' > /etc/wsl.conf
+'@
     & wsl --terminate $WslDistro 2>&1 | Out-Null   # apply /etc/wsl.conf boot command
 
-    # Start dockerd and WAIT for it — the daemon needs a few seconds to open its socket,
-    # so a single immediate `docker info` would false-negative. On failure, print the real
-    # error (the trailing `docker info` + `exit 1`) so it's diagnosable, not a vague warning.
-    $verify = 'service docker start >/dev/null 2>&1; ' +
-              'for i in $(seq 1 30); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; ' +
-              'echo "=== docker did not start ==="; docker info 2>&1 | tail -n 25; exit 1'
-    $out = & wsl -d $WslDistro -- sh -lc $verify 2>&1
+    # Start dockerd and WAIT for its socket (the daemon needs a few seconds), so a single
+    # immediate `docker info` doesn't false-negative. On failure the script prints the real
+    # error and exits 1, so it's diagnosable instead of a vague warning.
+    $out = Wsl-RunScript @'
+service docker start >/dev/null 2>&1
+i=0
+while [ $i -lt 30 ]; do docker info >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done
+echo "=== docker did not start ==="
+docker info 2>&1 | tail -n 25
+exit 1
+'@
     if ($LASTEXITCODE -eq 0) {
         Log "WSL hosting ready (distro '$WslDistro')"
     } else {
-        Warn "Docker did not come up in '$WslDistro'. Details below; re-run the installer or inspect with: wsl -d $WslDistro -- sh -lc 'service docker start; docker info'"
+        Warn "Docker did not come up in '$WslDistro'. Details below; re-run, or inspect with: wsl -d $WslDistro -- bash -c 'service docker start; docker info'"
         @($setupOut + $out | Select-Object -Last 30) | ForEach-Object { Warn "  $_" }
     }
 }

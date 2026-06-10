@@ -158,8 +158,8 @@ def _ensure_engine_ready():
         # Start dockerd and wait for its socket (it takes a few seconds), so the very next
         # container command doesn't race a not-yet-listening daemon. Exits 0 once `docker
         # info` succeeds, non-zero if it never comes up.
-        wait = ("service docker start >/dev/null 2>&1; "
-                "for i in $(seq 1 30); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1")
+        wait = ("service docker start >/dev/null 2>&1; i=0; "
+                "while [ $i -lt 30 ]; do docker info >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done; exit 1")
         r = subprocess.run(
             ["wsl", "-d", WSL_DISTRO, "--", "sh", "-lc", wait],
             capture_output=True, text=True, timeout=180)
