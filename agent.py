@@ -125,6 +125,40 @@ def _runtime():
     return _RUNTIME_CACHE
 
 
+_ENGINE_READY = False
+
+
+def _ensure_engine_ready():
+    """On Windows, `podman` runs containers inside a WSL2 VM ("podman machine") that does
+    NOT auto-start at logon/boot — so after a restart the machine is stopped, every
+    container is down, and `podman ...` fails with "Cannot connect to Podman". Start it
+    (idempotent; no-op if already running) once per agent process before the first
+    container command. We do NOT `init` here: creating the VM downloads a large image and
+    would block the poll loop for minutes — that's the installer's job. If no machine
+    exists, the start fails fast and the next command's stderr makes the cause obvious."""
+    global _ENGINE_READY
+    if _ENGINE_READY:
+        return
+    _ENGINE_READY = True
+    if not (IS_WINDOWS and _runtime() == "podman"):
+        return
+    try:
+        r = subprocess.run(["podman", "machine", "start"],
+                           capture_output=True, text=True, timeout=180)
+        out = (r.stderr or r.stdout or "").strip()
+        if r.returncode == 0:
+            _log("podman machine started")
+        elif "already running" in out.lower():
+            _debug("podman machine already running")
+        else:
+            # Most likely no machine exists yet — surface it; hosting needs the installer's
+            # `podman machine init` (or a manual one) to have succeeded.
+            _log(f"podman machine not available: {out[-300:]!r} "
+                 f"(run once: podman machine init; podman machine start)")
+    except Exception as e:  # noqa: BLE001 — never let engine bootstrap kill the agent
+        _debug(f"podman machine start error: {type(e).__name__}: {e}")
+
+
 def _shell_argv(script):
     """Pick the shell to run a bot-issued script. The bot emits POSIX `docker` one-
     liners (see provisioner.py), so we need a POSIX shell. On Linux that's `bash`.
@@ -205,6 +239,7 @@ def _run_shell(payload):
         # (they call `${MCSPAWN_RT:-docker} …`), so one script set runs on docker/podman/
         # nerdctl without the bot knowing what's installed on the box (Phase 6.5).
         rt = _runtime()
+        _ensure_engine_ready()   # Windows/podman: make sure the WSL machine is up first
         env = {**os.environ, "MCSPAWN_RT": rt}
         argv = _shell_argv(payload["script"])
         p = subprocess.run(

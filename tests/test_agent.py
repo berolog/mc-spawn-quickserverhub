@@ -47,6 +47,30 @@ class ShellLoggingTests(unittest.TestCase):
         self.assertEqual(logged, [])
 
 
+class EngineReadyTests(unittest.TestCase):
+    def setUp(self):
+        agent._ENGINE_READY = False
+        agent._RUNTIME_CACHE = None
+        self.addCleanup(lambda: setattr(agent, "_ENGINE_READY", False))
+        self.addCleanup(lambda: setattr(agent, "_RUNTIME_CACHE", None))
+
+    def test_noop_off_windows(self):
+        with mock.patch.object(agent, "IS_WINDOWS", False), \
+             mock.patch.object(agent.subprocess, "run") as run:
+            agent._ensure_engine_ready()
+        run.assert_not_called()
+
+    def test_windows_podman_starts_machine_once(self):
+        with mock.patch.object(agent, "IS_WINDOWS", True), \
+             mock.patch.object(agent, "_runtime", return_value="podman"), \
+             mock.patch.object(agent.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            agent._ensure_engine_ready()
+            agent._ensure_engine_ready()   # cached — must not start twice
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args[0][0], ["podman", "machine", "start"])
+
+
 class ExecuteDispatchTests(unittest.TestCase):
     def test_unknown_kind(self):
         status, _res = agent._execute({"kind": "nope", "payload": {}})

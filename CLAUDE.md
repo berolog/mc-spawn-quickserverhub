@@ -194,6 +194,11 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
     ridden out instead of hammered. **The agent stays a dumb executor** — it does NOT decide what
     should run; the bot's reconciler pushes `start`/recreate/`playit_start` to close drift, and the
     recreate reattaches the `<container>_data` volume so the world survives a manual `docker rm`.
+    **Windows/podman:** containers live in a WSL2 "podman machine" that does NOT auto-start at
+    logon/boot, so `_ensure_engine_ready()` runs `podman machine start` (idempotent, once per
+    process) before the first container command — otherwise every container is down after a restart
+    and `podman` reports "Cannot connect". It only *starts* (never `init`s — creating the VM is slow
+    and is the installer's job); a missing machine is logged with the manual fix.
 13. **Full self-uninstall on machine delete.** The `uninstall` `{containers}` command purges the
     listed MC containers + their `_data` volumes and tears down playit **synchronously**, then spawns
     a **detached** cleanup (systemd-run / new-session `sh`, or PowerShell on Windows) that removes the

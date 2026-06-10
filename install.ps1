@@ -212,6 +212,40 @@ if (-not (Have bash)) {
 }
 
 # Container engine — prefer the lightweight, license-free Podman over Docker Desktop.
+# Podman runs containers in a WSL2 VM ("podman machine"). This block sets that machine up
+# and VERIFIES it actually answers (`podman info`) — showing the real error and the manual
+# steps if not, instead of a vague "not running yet".
+function Setup-PodmanMachine {
+    # A working machine already?
+    & podman info 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Log 'podman engine ready'; return }
+
+    $machines = & podman machine list --format '{{.Name}}' 2>$null
+    if (-not $machines) {
+        Log 'creating the Podman machine — downloads a small WSL2 VM, can take a few minutes…'
+        $out = & podman machine init 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            # WSL2 often just needs its kernel updated; try once then re-init.
+            Log 'podman machine init failed; updating WSL and retrying…'
+            & wsl --update 2>&1 | Out-Null
+            $out = & podman machine init 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Warn "podman machine init failed: $($out -join ' ')"
+                Warn 'Hosting needs WSL2. Fix once (admin PowerShell): `wsl --install` then REBOOT, then re-run this installer.'
+                return
+            }
+        }
+    }
+    $out = & podman machine start 2>&1
+    if ($LASTEXITCODE -ne 0 -and "$out" -notmatch 'already running') {
+        Warn "podman machine start failed: $($out -join ' ')"
+        return
+    }
+    & podman info 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Log 'podman engine ready' }
+    else { Warn 'podman machine started but the engine is not answering yet — run `podman machine start` and check `podman info`.' }
+}
+
 if ((Have docker) -or (Have nerdctl)) {
     Log 'container engine already present'
 } else {
@@ -220,16 +254,8 @@ if ((Have docker) -or (Have nerdctl)) {
         Winget-Install 'RedHat.Podman' | Out-Null
     }
     if (Have podman) {
-        try {
-            if (-not (& podman machine list --format '{{.Name}}' 2>$null)) {
-                Log 'setting up the Podman machine — downloads a small WSL2 VM, can take a few minutes…'
-                & podman machine init 2>$null | Out-Null
-            }
-            & podman machine start 2>$null | Out-Null
-            Log 'podman ready'
-        } catch {
-            Warn 'Podman installed but its machine is not running yet — run once: `podman machine init; podman machine start` (needs WSL2: `wsl --install` + reboot if missing).'
-        }
+        try { Setup-PodmanMachine }
+        catch { Warn "podman setup error: $($_.Exception.Message). Run once: `podman machine init; podman machine start`." }
     } else {
         Warn 'No container engine yet. To host a server install Podman (`winget install RedHat.Podman`) or Docker Desktop. Monitoring/RCON already work.'
     }
