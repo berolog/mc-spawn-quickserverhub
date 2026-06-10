@@ -77,18 +77,27 @@ $env:CONTROL_URL='https://agent.quickserverhub.com'; $env:TOKEN='<one-time-token
   irm https://raw.githubusercontent.com/berolog/mc-spawn-quickserverhub/main/install.ps1 | iex
 ```
 
-`install.ps1` best-effort installs **Python 3** and **Git for Windows** (for `bash`,
-which the provisioning scripts need) via `winget`, and for the container engine it
-prefers **Podman** (free, CLI-only — **no Docker Desktop / no license**; it sets up a
-small WSL2-backed machine on first use). Docker or nerdctl are used instead if already
-present. It registers a **Scheduled Task** that runs **as you** (never SYSTEM, so it
-sees your Python/engine) — at startup without login when run elevated (S4U), otherwise
-at logon — and restarts on failure. Monitoring and RCON work without any engine;
-**hosting a server needs a container engine + bash**.
+On Windows, **hosting runs inside WSL** — there is one path, no Docker Desktop, no
+Podman, no Git‑Bash. `install.ps1`:
 
-The installer resolves an **absolute** `python.exe` and bakes it into the launcher, so
-it dodges two classic Windows traps: the Microsoft Store `python` stub (a no-op that
-opens the Store) and a freshly-installed Python not yet on `PATH`.
+1. installs **Python 3** per‑user via `winget` to run the agent (it resolves an
+   **absolute** `python.exe`, dodging the Microsoft Store `python` stub and unrefreshed
+   `PATH`), and registers autostart that runs **as you** (never SYSTEM) — a Scheduled Task
+   (S4U at startup if elevated, else at logon), or, if the Task Scheduler is locked down,
+   an HKCU `Run` key;
+2. for hosting, sets up a dedicated **WSL2 distro `mc-spawn`** (imported from a small
+   Ubuntu rootfs — no Microsoft Store) with **Docker** inside it, started on boot via
+   `/etc/wsl.conf`. Servers then run exactly like on Ubuntu; WSL2 forwards their ports to
+   Windows `localhost`.
+
+**No admin is needed** — with one unavoidable exception: if WSL isn't enabled on the
+machine yet, enabling it is a one‑time admin step (open an **admin** PowerShell, run
+`wsl --install`, **reboot**, then re‑run this installer). That's a Windows security
+boundary, not ours. Monitoring and RCON work even before WSL/hosting is set up.
+
+Override the distro name with `MCSPAWN_WSL_DISTRO` and the rootfs with
+`MCSPAWN_WSL_ROOTFS_URL`. Deleting the machine in the bot unregisters the whole
+`mc-spawn` distro, so removal is clean.
 
 ### Manual run (dev)
 
@@ -106,7 +115,10 @@ CONTROL_URL=http://127.0.0.1:8080 TOKEN=<token> AGENT_STATE=/tmp/cred.json pytho
 | `AGENT_RAW` | no | this repo's GitHub raw | Base URL `agent.py` is fetched from (forks / pinned commits). |
 | `AGENT_LOG` | no | `agent.log` next to the cred file | Where the agent appends its log (it runs detached, so this file is how you see what it did). |
 | `MCSPAWN_DEBUG` | no | off | `1` ⇒ verbose logs (engine detection, per-command output). Secrets/script text are never logged. |
-| `CONTAINER_RUNTIME` | no | auto (`docker`→`podman`→`nerdctl`) | Force a specific container engine. |
+| `CONTAINER_RUNTIME` | no | Linux: auto (`docker`→`podman`→`nerdctl`); Windows: `docker` (in WSL) | Force a specific container engine. |
+| `MCSPAWN_WSL_DISTRO` | no | `mc-spawn` | (Windows) name of the dedicated WSL distro hosting runs in. |
+| `MCSPAWN_WSL_ROOTFS_URL` | no | Ubuntu WSL rootfs | (Windows) rootfs the installer imports for that distro. |
+| `AGENT_SHELL` | no | `bash` (Linux) / `wsl -d <distro>` (Windows) | Override the shell scripts run in (e.g. a non-WSL Windows setup). |
 
 ## Manage
 

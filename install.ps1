@@ -3,13 +3,15 @@
 #   $env:CONTROL_URL='<control-url>'; $env:TOKEN='<token>'; `
 #     irm https://raw.githubusercontent.com/berolog/mc-spawn-quickserverhub/main/install.ps1 | iex
 #
-# Mirrors install.sh: outbound-only (opens NO inbound ports), registers a Scheduled
-# Task that runs as YOU (never SYSTEM — see below) and restarts on failure. Works with
-# or without admin. Inspect this script and agent.py before running (open source).
+# Mirrors install.sh: outbound-only (opens NO inbound ports), registers autostart that
+# runs as YOU (never SYSTEM — see below). Works without admin. Inspect this and agent.py
+# before running (open source).
 #
-# Prereqs (best-effort via winget): Python 3, Git (for bash — the bot's provisioning
-# scripts are POSIX and run via `bash -c`), and a container engine. We prefer **Podman**
-# (free, CLI-only, no Docker Desktop / no license) and only fall back to linking Docker.
+# What it sets up: Python 3 (per-user via winget) to run the agent, and — for HOSTING —
+# a dedicated **WSL2 Linux distro** (`mc-spawn`) with Docker inside, where servers run "as
+# on Ubuntu". This is the single Windows hosting path (no Docker Desktop, no Podman, no
+# Git-Bash). The ONLY admin step, and only on a box without WSL, is enabling WSL once
+# (`wsl --install` + reboot) — a Windows security boundary we can't bypass.
 
 $ErrorActionPreference = 'Stop'
 
@@ -118,12 +120,14 @@ Invoke-WebRequest -UseBasicParsing -Uri "$AgentRaw/agent.py" -OutFile (Join-Path
 $Run = Join-Path $Dir 'run.cmd'
 $CredPath = Join-Path $State 'cred.json'
 $DebugFlag = $env:MCSPAWN_DEBUG   # set MCSPAWN_DEBUG=1 before running to get verbose logs
+$WslDistro = if ($env:MCSPAWN_WSL_DISTRO) { $env:MCSPAWN_WSL_DISTRO } else { 'mc-spawn' }
 @"
 @echo off
 set "CONTROL_URL=$ControlUrl"
 set "TOKEN=$Token"
 set "AGENT_STATE=$CredPath"
 set "MCSPAWN_DEBUG=$DebugFlag"
+set "MCSPAWN_WSL_DISTRO=$WslDistro"
 rem Self-heal (Phase 6.5): re-fetch agent.py if the user deleted it by hand.
 if not exist "$($Dir)\agent.py" powershell -NoProfile -Command "irm '$AgentRaw/agent.py' -OutFile '$($Dir)\agent.py'"
 "$Python" "$($Dir)\agent.py"
@@ -136,9 +140,9 @@ function Lock-ToCurrentUser ($path) {
 Lock-ToCurrentUser $Run
 
 # ---- service registration: Scheduled Task running AS THE CURRENT USER ----
-# Never SYSTEM: the agent must see the user's Python and (for hosting) the user's
-# docker/podman, which live in the user profile. Admin lets us use S4U so it also
-# starts at boot without anyone logging in; without admin it starts at logon.
+# Never SYSTEM: the agent must see the user's Python and the user's WSL (the `mc-spawn`
+# distro is per-user). Admin lets us use S4U so it also starts at boot without anyone
+# logging in; without admin it starts at logon.
 $TaskName = 'mc-spawn-agent'
 $UserId   = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action   = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" `
@@ -199,67 +203,67 @@ if (-not $registered) {
     catch { Die "could not set up autostart (Task Scheduler and Run key both failed): $_" }
 }
 
-# ---- hosting prerequisites (best-effort, AFTER the agent is up so the bot sees it) ----
-# These are only needed to HOST a server (not to enroll / monitor / RCON). They can be
-# slow (Podman downloads a small WSL2 VM image), so we do them last — Ctrl-C here leaves
-# a working, enrolled agent; you can re-run the installer or set them up by hand later.
-if (-not (Have bash)) {
-    Log 'installing Git for Windows (provides bash, needed to host a server)…'
-    Winget-Install 'Git.Git' | Out-Null
-}
-if (-not (Have bash)) {
-    Warn 'bash not found — monitoring/RCON work, but hosting a server needs bash (install Git for Windows or enable WSL).'
+# ---- hosting backend: a dedicated WSL2 Linux distro with Docker inside --------------
+# THE single Windows hosting path: servers run "as on Ubuntu" inside an isolated `mc-spawn`
+# WSL distro. Only needed to HOST (not to enroll/monitor/RCON), and slow (imports a rootfs +
+# installs Docker), so it runs LAST — Ctrl-C here leaves a working, enrolled agent. No admin,
+# EXCEPT the one Windows step we can't bypass: enabling WSL itself (once) on a box without it.
+$env:WSL_UTF8 = '1'   # make `wsl -l -q` emit UTF-8, not UTF-16 (which breaks -match)
+
+function Wsl-Enabled {
+    & wsl --status 2>&1 | Out-Null
+    return ($LASTEXITCODE -eq 0)
 }
 
-# Container engine — prefer the lightweight, license-free Podman over Docker Desktop.
-# Podman runs containers in a WSL2 VM ("podman machine"). This block sets that machine up
-# and VERIFIES it actually answers (`podman info`) — showing the real error and the manual
-# steps if not, instead of a vague "not running yet".
-function Setup-PodmanMachine {
-    # A working machine already?
-    & podman info 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Log 'podman engine ready'; return }
-
-    $machines = & podman machine list --format '{{.Name}}' 2>$null
-    if (-not $machines) {
-        Log 'creating the Podman machine — downloads a small WSL2 VM, can take a few minutes…'
-        $out = & podman machine init 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            # WSL2 often just needs its kernel updated; try once then re-init.
-            Log 'podman machine init failed; updating WSL and retrying…'
-            & wsl --update 2>&1 | Out-Null
-            $out = & podman machine init 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Warn "podman machine init failed: $($out -join ' ')"
-                Warn 'Hosting needs WSL2. Fix once (admin PowerShell): `wsl --install` then REBOOT, then re-run this installer.'
-                return
-            }
-        }
-    }
-    $out = & podman machine start 2>&1
-    if ($LASTEXITCODE -ne 0 -and "$out" -notmatch 'already running') {
-        Warn "podman machine start failed: $($out -join ' ')"
+function Setup-WslHosting {
+    if (-not (Wsl-Enabled)) { & wsl --update 2>&1 | Out-Null }   # best-effort kernel update
+    if (-not (Wsl-Enabled)) {
+        Warn 'WSL is not enabled. This is the ONLY step that needs admin, and only once:'
+        Warn '  1) open PowerShell as Administrator   2) run:  wsl --install   3) REBOOT'
+        Warn '  4) re-run this installer (no admin needed after that). Monitoring/RCON already work.'
         return
     }
-    & podman info 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { Log 'podman engine ready' }
-    else { Warn 'podman machine started but the engine is not answering yet — run `podman machine start` and check `podman info`.' }
+
+    $have = @(& wsl -l -q | ForEach-Object { $_.Trim() }) -contains $WslDistro
+    if ($have) {
+        & wsl -d $WslDistro -- sh -lc 'service docker start >/dev/null 2>&1; docker info >/dev/null 2>&1'
+        if ($LASTEXITCODE -eq 0) { Log "WSL hosting ready (distro '$WslDistro')"; return }
+    } else {
+        Log "creating the '$WslDistro' WSL distro (downloads a small Ubuntu rootfs)…"
+        $rootfsUrl = if ($env:MCSPAWN_WSL_ROOTFS_URL) { $env:MCSPAWN_WSL_ROOTFS_URL } `
+                     else { 'https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz' }
+        $tar = Join-Path $Dir 'distro-rootfs.tar.gz'
+        $distroDir = Join-Path $Dir 'wsl'
+        New-Item -ItemType Directory -Force -Path $distroDir | Out-Null
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $rootfsUrl -OutFile $tar
+            & wsl --import $WslDistro $distroDir $tar --version 2
+            if ($LASTEXITCODE -ne 0) { throw 'wsl --import failed' }
+        } catch {
+            Warn "could not create the WSL distro: $_"
+            Warn 'Set MCSPAWN_WSL_ROOTFS_URL to a valid Ubuntu WSL rootfs and re-run. Monitoring/RCON still work.'
+            return
+        } finally {
+            Remove-Item $tar -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Install Docker inside the distro (root → no admin, no password) and make it start on
+    # every distro boot via /etc/wsl.conf (no systemd dependency). Then restart + verify.
+    Log 'installing Docker inside the distro (one-time)…'
+    $setup = 'export DEBIAN_FRONTEND=noninteractive; ' +
+             'command -v docker >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq docker.io; }; ' +
+             'printf ''[boot]\ncommand=service docker start\n'' > /etc/wsl.conf; ' +
+             'service docker start >/dev/null 2>&1 || true'
+    & wsl -d $WslDistro -- sh -lc $setup 2>&1 | Out-Null
+    & wsl --terminate $WslDistro 2>&1 | Out-Null   # apply /etc/wsl.conf boot command
+    & wsl -d $WslDistro -- sh -lc 'service docker start >/dev/null 2>&1; docker info >/dev/null 2>&1'
+    if ($LASTEXITCODE -eq 0) { Log "WSL hosting ready (distro '$WslDistro')" }
+    else { Warn "Docker did not come up in '$WslDistro' — re-run the installer, or check: wsl -d $WslDistro -- docker info" }
 }
 
-if ((Have docker) -or (Have nerdctl)) {
-    Log 'container engine already present'
-} else {
-    if (-not (Have podman)) {
-        Log 'installing Podman (lightweight, no Docker Desktop / no license)…'
-        Winget-Install 'RedHat.Podman' | Out-Null
-    }
-    if (Have podman) {
-        try { Setup-PodmanMachine }
-        catch { Warn "podman setup error: $($_.Exception.Message). Run once: `podman machine init; podman machine start`." }
-    } else {
-        Warn 'No container engine yet. To host a server install Podman (`winget install RedHat.Podman`) or Docker Desktop. Monitoring/RCON already work.'
-    }
-}
+try { Setup-WslHosting } catch { Warn "WSL hosting setup error: $($_.Exception.Message)" }
+
 Log "done. Управление — в Telegram-боте. Лог агента: $Dir\agent.log"
 Log "посмотреть лог:   Get-Content '$Dir\agent.log' -Wait"
 Log 'подробный лог:    перед запуском установщика задай  $env:MCSPAWN_DEBUG=1'

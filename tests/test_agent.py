@@ -60,15 +60,17 @@ class EngineReadyTests(unittest.TestCase):
             agent._ensure_engine_ready()
         run.assert_not_called()
 
-    def test_windows_podman_starts_machine_once(self):
+    def test_windows_starts_wsl_distro_docker_once(self):
         with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.object(agent, "_runtime", return_value="podman"), \
+             mock.patch.object(agent, "WSL_DISTRO", "mc-spawn"), \
              mock.patch.object(agent.subprocess, "run") as run:
             run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
             agent._ensure_engine_ready()
             agent._ensure_engine_ready()   # cached — must not start twice
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args[0][0], ["podman", "machine", "start"])
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:4], ["wsl", "-d", "mc-spawn", "--"])
+        self.assertIn("service docker start", argv[-1])
 
 
 class ExecuteDispatchTests(unittest.TestCase):
@@ -487,17 +489,20 @@ class CrossPlatformTests(unittest.TestCase):
             agent.os.environ.pop("AGENT_SHELL", None)
             self.assertEqual(agent._shell_argv("x"), ["bash", "-c", "x"])
 
-    def test_shell_argv_windows_prefers_bash_when_present(self):
+    def test_shell_argv_windows_routes_through_wsl_distro(self):
         with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.object(agent.shutil, "which", return_value="C:/bash.exe"):
+             mock.patch.object(agent, "WSL_DISTRO", "mc-spawn"):
             agent.os.environ.pop("AGENT_SHELL", None)
-            self.assertEqual(agent._shell_argv("x"), ["bash", "-c", "x"])
+            self.assertEqual(
+                agent._shell_argv("x"),
+                ["wsl", "-d", "mc-spawn", "--", "bash", "-lc", "x"])
 
-    def test_shell_argv_windows_falls_back_to_cmd(self):
+    def test_runtime_windows_is_docker(self):
         with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.object(agent.shutil, "which", return_value=None):
-            agent.os.environ.pop("AGENT_SHELL", None)
-            self.assertEqual(agent._shell_argv("x"), ["cmd", "/c", "x"])
+             mock.patch.object(agent, "_RUNTIME_CACHE", None):
+            agent.os.environ.pop("CONTAINER_RUNTIME", None)
+            self.assertEqual(agent._runtime(), "docker")
+        agent._RUNTIME_CACHE = None
 
     def test_shell_argv_env_override_wins(self):
         with mock.patch.dict(agent.os.environ, {"AGENT_SHELL": "zsh"}):
@@ -511,15 +516,13 @@ class CrossPlatformTests(unittest.TestCase):
             self.assertTrue(agent._default_state_path().endswith("cred.json"))
             self.assertIn("mc-spawn-agent", agent._default_state_path())
 
-    def test_playit_networking_per_os(self):
-        with mock.patch.object(agent, "IS_WINDOWS", False):
-            agent.os.environ.pop("PLAYIT_LOCAL_IP", None)
-            self.assertEqual(agent._playit_local_ip(), "127.0.0.1")
-            self.assertEqual(agent._playit_net_args(), ["--network", "host"])
-        with mock.patch.object(agent, "IS_WINDOWS", True):
-            agent.os.environ.pop("PLAYIT_LOCAL_IP", None)
-            self.assertEqual(agent._playit_local_ip(), "host.docker.internal")
-            self.assertIn("host.docker.internal:host-gateway", agent._playit_net_args())
+    def test_playit_networking_is_host_net_both_os(self):
+        # playit runs inside Linux on both (the WSL distro on Windows), so host-net + loopback.
+        for is_win in (False, True):
+            with mock.patch.object(agent, "IS_WINDOWS", is_win):
+                agent.os.environ.pop("PLAYIT_LOCAL_IP", None)
+                self.assertEqual(agent._playit_local_ip(), "127.0.0.1")
+                self.assertEqual(agent._playit_net_args(), ["--network", "host"])
 
     def test_playit_local_ip_env_override(self):
         with mock.patch.dict(agent.os.environ, {"PLAYIT_LOCAL_IP": "10.0.0.5"}):

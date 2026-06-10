@@ -13,9 +13,12 @@ Config via env: CONTROL_URL (required), TOKEN (one-time, first run only),
 AGENT_STATE (cred file; default /etc/mc-spawn-agent/cred.json on Linux,
 %LOCALAPPDATA%\\mc-spawn-agent\\cred.json on Windows).
 
-Cross-platform (Linux + Windows): paths, the script shell, and the playit container's
-networking adapt to the OS; MC hosting + RCON already work on both via port mapping
-(Docker Desktop publishes ports to the host's localhost). See install.sh / install.ps1.
+Cross-platform (Linux + Windows): on Linux the agent runs the engine directly; on Windows
+hosting runs inside a dedicated WSL2 Linux distro (`mc-spawn`) — `_shell_argv` routes every
+engine command through `wsl -d <distro>`, so it is "just Linux" there (Docker, host-net
+playit, 127.0.0.1). WSL2 forwards published container ports to Windows localhost, so RCON and
+the MC port work from the Windows side. The installer sets the distro up. See install.sh /
+install.ps1.
 
 Thin by design: all Minecraft logic lives in the bot (mc-spawn-bot) — the agent is
 a small, auditable executor. This is the client half of the system and lives in its
@@ -25,6 +28,7 @@ drop-in (same versioned HTTP protocol — PROTOCOL_VERSION).
 import json
 import os
 import platform
+import shlex
 import shutil
 import socket
 import struct
@@ -36,6 +40,12 @@ import urllib.request
 
 # Phase 6: the agent is cross-platform (Linux + Windows). os.name == "nt" on Windows.
 IS_WINDOWS = os.name == "nt"
+
+# Windows hosting runs entirely inside a dedicated WSL2 Linux distro (so it is "just
+# Linux" — Docker, host-net playit, 127.0.0.1). The agent stays a Windows process but
+# shells every engine command into this distro via `wsl -d <distro>`. The installer
+# imports it (no Store, no admin); override the name with MCSPAWN_WSL_DISTRO.
+WSL_DISTRO = os.environ.get("MCSPAWN_WSL_DISTRO", "mc-spawn").strip() or "mc-spawn"
 
 # Versioned control-plane contract (Phase 6): the agent advertises this on every
 # call so a future compiled (Go) binary can be a drop-in and the control plane can
@@ -106,18 +116,20 @@ _RUNTIME_CACHE = None
 
 
 def _runtime():
-    """The container engine to use (Phase 6.5). Auto-detect `docker → podman → nerdctl`
-    on PATH; `CONTAINER_RUNTIME` env overrides. Cached. All three share the run/-p/-v/
-    start/stop/rm/logs/inspect surface the bot's scripts use, so the engine is a drop-in.
-    Defaults to `docker` if none is found (so an absent engine still produces sensible
-    error output rather than crashing here). The bot's scripts read it via `$MCSPAWN_RT`;
-    the agent's own playit commands call this directly."""
+    """The container engine to use. `CONTAINER_RUNTIME` env overrides; cached. On Windows
+    the engine lives INSIDE the WSL distro (see `_shell_argv`), not on the Windows PATH, so
+    we just use `docker` (what the installer puts in the distro) — Windows-side `shutil.which`
+    is irrelevant there. On Linux, auto-detect `docker → podman → nerdctl` on PATH (all share
+    the run/-p/-v/start/stop/rm/logs/inspect surface, so the engine is a drop-in), defaulting
+    to `docker`. The bot's scripts read it via `$MCSPAWN_RT`."""
     global _RUNTIME_CACHE
     if _RUNTIME_CACHE is not None:
         return _RUNTIME_CACHE
     override = os.environ.get("CONTAINER_RUNTIME", "").strip()
     if override:
         _RUNTIME_CACHE = override
+    elif IS_WINDOWS:
+        _RUNTIME_CACHE = "docker"  # runs inside WSL; engine is the distro's docker
     else:
         found = {rt: shutil.which(rt) for rt in ("docker", "podman", "nerdctl")}
         _RUNTIME_CACHE = next((rt for rt, p in found.items() if p), "docker")
@@ -129,50 +141,48 @@ _ENGINE_READY = False
 
 
 def _ensure_engine_ready():
-    """On Windows, `podman` runs containers inside a WSL2 VM ("podman machine") that does
-    NOT auto-start at logon/boot — so after a restart the machine is stopped, every
-    container is down, and `podman ...` fails with "Cannot connect to Podman". Start it
-    (idempotent; no-op if already running) once per agent process before the first
-    container command. We do NOT `init` here: creating the VM downloads a large image and
-    would block the poll loop for minutes — that's the installer's job. If no machine
-    exists, the start fails fast and the next command's stderr makes the cause obvious."""
+    """On Windows the engine lives in the WSL distro, and neither the distro nor its dockerd
+    auto-start at logon/boot — so after a restart every container is down and `docker` is
+    unreachable. Start the distro + dockerd once per agent process before the first container
+    command (idempotent; `wsl -d <distro> -- service docker start` boots the distro and the
+    daemon). We do NOT import the distro or install docker here: that's the installer's slow,
+    one-time job; if the distro is missing this fails fast and the next command's stderr makes
+    the cause obvious. No-op on Linux."""
     global _ENGINE_READY
     if _ENGINE_READY:
         return
     _ENGINE_READY = True
-    if not (IS_WINDOWS and _runtime() == "podman"):
+    if not IS_WINDOWS:
         return
     try:
-        r = subprocess.run(["podman", "machine", "start"],
-                           capture_output=True, text=True, timeout=180)
-        out = (r.stderr or r.stdout or "").strip()
+        r = subprocess.run(
+            ["wsl", "-d", WSL_DISTRO, "--", "sh", "-lc", "service docker start 2>&1 || true"],
+            capture_output=True, text=True, timeout=180)
+        out = (r.stdout or r.stderr or "").strip()
         if r.returncode == 0:
-            _log("podman machine started")
-        elif "already running" in out.lower():
-            _debug("podman machine already running")
+            _debug(f"wsl '{WSL_DISTRO}' docker start: {out[-200:]!r}")
         else:
-            # Most likely no machine exists yet — surface it; hosting needs the installer's
-            # `podman machine init` (or a manual one) to have succeeded.
-            _log(f"podman machine not available: {out[-300:]!r} "
-                 f"(run once: podman machine init; podman machine start)")
+            # Most likely the distro doesn't exist yet — hosting needs the installer's
+            # `wsl --import` + docker setup to have run.
+            _log(f"wsl distro '{WSL_DISTRO}' not ready: {out[-300:]!r} "
+                 f"(re-run the installer to set up WSL hosting)")
     except Exception as e:  # noqa: BLE001 — never let engine bootstrap kill the agent
-        _debug(f"podman machine start error: {type(e).__name__}: {e}")
+        _debug(f"wsl docker start error: {type(e).__name__}: {e}")
 
 
 def _shell_argv(script):
-    """Pick the shell to run a bot-issued script. The bot emits POSIX `docker` one-
-    liners (see provisioner.py), so we need a POSIX shell. On Linux that's `bash`.
-    On Windows `bash` is either Git-Bash OR `C:\\Windows\\System32\\bash.exe` (the WSL
-    launcher) — and if it's the latter the script (and thus the container engine it calls)
-    runs INSIDE the default WSL distro, where Docker/podman actually live. That's why the
-    agent's own engine commands must also go through this shell, not a direct subprocess
-    (which would hit a Windows-side engine that may not exist). Falls back to `cmd /c`
-    only if there's genuinely no bash. Override with AGENT_SHELL."""
+    """Pick the argv to run a bot-issued POSIX script (the bot emits `docker` one-liners —
+    see provisioner.py). On **Linux** that's `bash -c`. On **Windows** hosting runs inside
+    the dedicated WSL distro, so we route through `wsl -d <distro> -- bash -lc` — the script,
+    and the container engine it calls, execute as Linux inside the distro (where Docker
+    lives). This is the single place that pins "engine = WSL," so provisioning, reconcile,
+    lifecycle, `_uninstall`, and playit all follow. Override the whole shell with AGENT_SHELL
+    (e.g. for a non-WSL Windows setup)."""
     override = os.environ.get("AGENT_SHELL")
     if override:
         return [override, "-c", script]
-    if IS_WINDOWS and not shutil.which("bash"):
-        return ["cmd", "/c", script]
+    if IS_WINDOWS:
+        return ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script]
     return ["bash", "-c", script]
 
 
@@ -335,25 +345,18 @@ PLAYIT_VERSION = os.environ.get("PLAYIT_VERSION", "playit 1.0.9")
 
 
 def _playit_local_ip():
-    """Address the playit container uses to reach the local MC server's published port
-    (Phase 6, cross-platform). On Linux we run playit with `--network host`, so the
-    host loopback `127.0.0.1:<mc_port>` is correct. On Windows/macOS, Docker Desktop
-    runs containers in a Linux VM where `--network host` does NOT expose the host's
-    ports, so playit must reach the host via the Docker-Desktop alias
-    `host.docker.internal`. Override with PLAYIT_LOCAL_IP. (Live-verify on Windows.)"""
-    override = os.environ.get("PLAYIT_LOCAL_IP")
-    if override:
-        return override
-    return "127.0.0.1" if not IS_WINDOWS else "host.docker.internal"
+    """Address the playit container uses to reach the local MC server's published port.
+    Everything runs inside Linux (native Linux, or the WSL distro on Windows), where playit
+    uses `--network host`, so the loopback `127.0.0.1:<mc_port>` is correct on both. Override
+    with PLAYIT_LOCAL_IP."""
+    return os.environ.get("PLAYIT_LOCAL_IP") or "127.0.0.1"
 
 
 def _playit_net_args():
-    """Docker networking flags for the playit container per OS. Linux: host network.
-    Windows/macOS: bridge + a guaranteed `host.docker.internal` mapping so playit can
-    forward to the host-published MC port."""
-    if not IS_WINDOWS:
-        return ["--network", "host"]
-    return ["--add-host", "host.docker.internal:host-gateway"]
+    """Docker networking flags for the playit container: host network. Runs inside Linux on
+    both platforms (the WSL distro on Windows), so `--network host` reaches the MC port on
+    127.0.0.1 — no Docker-Desktop `host.docker.internal` shim needed."""
+    return ["--network", "host"]
 
 
 def _playit_api(path, body, secret=None):
@@ -491,11 +494,9 @@ def _playit_teardown():
     secret = _playit_secret()
     if secret:
         _playit_delete_tunnels(secret)
-    try:
-        subprocess.run([_runtime(), "rm", "-f", PLAYIT_CONTAINER],
-                       capture_output=True, text=True, timeout=30)
-    except Exception:  # noqa: BLE001
-        pass
+    # Through the shell (→ WSL on Windows) so we hit the SAME engine that started it; a
+    # direct subprocess([rt,…]) would miss the WSL Docker and leave the container behind.
+    _run_shell({"script": f"${{MCSPAWN_RT:-docker}} rm -f {PLAYIT_CONTAINER} 2>/dev/null; true"})
     try:
         os.remove(PLAYIT_KEY_PATH)
     except OSError:
@@ -503,20 +504,18 @@ def _playit_teardown():
 
 
 def _playit_run(secret):
-    """(Re)start the playit agent under the user's secret via docker on the host network
-    (so it reaches 127.0.0.1:<mc_port>). Idempotent; never raises (docker may be
-    absent) — returns False on any failure so the playit op stays soft."""
-    try:
-        rt = _runtime()
-        subprocess.run([rt, "rm", "-f", PLAYIT_CONTAINER],
-                       capture_output=True, text=True, timeout=30)
-        return subprocess.run(
-            [rt, "run", "-d", "--name", PLAYIT_CONTAINER, "--restart", "unless-stopped",
-             *_playit_net_args(), "-e", "SECRET_KEY=" + secret, PLAYIT_IMAGE],
-            capture_output=True, text=True, timeout=120,
-        ).returncode == 0
-    except Exception:  # noqa: BLE001
-        return False
+    """(Re)start the playit agent under the user's secret via the engine, on the host
+    network (so it reaches 127.0.0.1:<mc_port>). Runs through the shell (→ WSL on Windows),
+    so it uses the distro's Docker. Idempotent; never raises — returns False on any failure
+    so the playit op stays soft. The secret is shell-quoted and never logged (the script
+    text isn't logged; only engine stderr/stdout, which don't echo it)."""
+    net = " ".join(_playit_net_args())
+    script = (
+        f"${{MCSPAWN_RT:-docker}} rm -f {PLAYIT_CONTAINER} 2>/dev/null; "
+        f"${{MCSPAWN_RT:-docker}} run -d --name {PLAYIT_CONTAINER} --restart unless-stopped "
+        f"{net} -e SECRET_KEY={shlex.quote(secret)} {shlex.quote(PLAYIT_IMAGE)}"
+    )
+    return _run_shell({"script": script}).get("exit") == 0
 
 
 def _playit(payload):
@@ -631,11 +630,11 @@ SERVICE_NAME = "mc-spawn-agent"
 
 def _uninstall(payload):
     for c in payload.get("containers", []):
-        # Run via the SAME shell as provisioning (`_run_shell` → bash; on Windows without
-        # Git-Bash that's `bash.exe` = WSL, where the engine actually lives). A direct
-        # subprocess([rt, ...]) here would call a Windows docker/podman that doesn't exist
-        # on a WSL-Docker box and orphan the containers. `${MCSPAWN_RT:-docker}` resolves
-        # the engine exactly like the bot's scripts do.
+        # Run via the SAME shell as provisioning (`_run_shell` → `_shell_argv`, which is
+        # `wsl -d <distro>` on Windows), so we hit the engine that created these containers
+        # (the distro's Docker). A direct subprocess([rt, ...]) would call a Windows-side
+        # engine that doesn't exist and orphan the containers. `${MCSPAWN_RT:-docker}`
+        # resolves the engine exactly like the bot's scripts do.
         _run_shell({"script":
             f"${{MCSPAWN_RT:-docker}} rm -f {c} 2>/dev/null; "
             f"${{MCSPAWN_RT:-docker}} volume rm {c}_data 2>/dev/null; true"})
@@ -663,11 +662,14 @@ def _spawn_self_cleanup():
         # Remove BOTH autostart forms the installer may have used: the Scheduled Task and
         # the HKCU Run-key fallback. schtasks delete is synchronous-safe; the file delete
         # waits out the lock on the running agent.py, then removes the dir tree.
+        # Also unregister the dedicated WSL distro — one shot removes every container,
+        # volume, and Docker inside it (the whole Linux hosting env), leaving the box clean.
         ps = (
             f"Start-Sleep 5; "
             f"schtasks /delete /tn {SERVICE_NAME} /f 2>$null; "
             f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' "
             f"-Name '{SERVICE_NAME}' -ErrorAction SilentlyContinue; "
+            f"wsl --terminate {WSL_DISTRO} 2>$null; wsl --unregister {WSL_DISTRO} 2>$null; "
             f"Remove-Item -Recurse -Force '{d}','{state_dir}' -ErrorAction SilentlyContinue"
         )
         subprocess.Popen(

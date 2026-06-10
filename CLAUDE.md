@@ -14,13 +14,14 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
 - `agent.py` — **stdlib only** (urllib/json/socket/struct/subprocess + platform/shutil). The
   whole client: `_enroll` (one-time `TOKEN` → long-lived secret, persisted `chmod 600`), `main`
   poll loop with backoff (re-enrolls once on 401 if a fresh `TOKEN` is present), `_execute`
-  dispatch → `_run_shell` (subprocess via `_shell_argv` — `bash -c`, or `cmd /c` on Windows
-  with no bash; `SHELL_TIMEOUT=600`), `_rcon` (tiny Source-RCON client to `127.0.0.1`),
+  dispatch → `_run_shell` (subprocess via `_shell_argv` — `bash -c` on Linux, `wsl -d <distro> --
+  bash -lc` on Windows; `SHELL_TIMEOUT=600`), `_rcon` (tiny Source-RCON client to `127.0.0.1`),
   `_playit` (granular per-port ops; tunnels named per local port via `_tunnel_name`). **Cross-
-  platform (Phase 6):** `IS_WINDOWS`, `_default_state_path` (Win → `%ProgramData%`), `_playit_net_args`/
-  `_playit_local_ip` (host-net+127.0.0.1 on Linux; `host.docker.internal` on Win/mac Docker
-  Desktop). **Phase 6.5:** `_runtime()` (engine auto-detect → `$MCSPAWN_RT`), 5xx backoff in the
-  poll loop, and `_uninstall`/`_spawn_self_cleanup` (full self-removal). Talks to `CONTROL_URL` via
+  platform:** `IS_WINDOWS`, `WSL_DISTRO`, `_default_state_path` (Win → `%LOCALAPPDATA%`),
+  `_playit_net_args`/`_playit_local_ip` (host-net + `127.0.0.1` on both — playit runs inside Linux,
+  i.e. the WSL distro on Windows). **Phase 6.5:** `_runtime()` (→ `$MCSPAWN_RT`), 5xx backoff,
+  `_ensure_engine_ready` (WSL distro + dockerd start on Windows), `_uninstall`/`_spawn_self_cleanup`
+  (full self-removal incl. `wsl --unregister`). Talks to `CONTROL_URL` via
   `_http`, which stamps `X-MC-Spawn-Protocol` (`PROTOCOL_VERSION`) + `X-MC-Spawn-Platform` on every
   call. No third-party deps — a Go rewrite is a drop-in behind the same versioned HTTP protocol.
 - `install.sh` — **portable POSIX-`sh`** one-liner installer (runs under Alpine's
@@ -34,21 +35,19 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   fallback. Escalates with `sudo` ONLY when a missing package needs root — present
   prereqs ⇒ a normal user installs rootless into `~/.local`+`~/.config`. The bot
   renders the full command (no forced `sudo`, piped to `sh`).
-- `install.ps1` — **Windows** PowerShell installer (Phase 6, parallel to `install.sh`). Reads
-  `CONTROL_URL`/`TOKEN` from env (`irm … | iex`), best-effort installs Python 3 + Git-for-Windows
-  (for `bash`) via **winget**, and for the engine **prefers Podman** (`RedHat.Podman` — free, CLI-
-  only, no Docker Desktop; auto `podman machine init/start`), falling back to an existing docker/
-  nerdctl or a warning. Resolves an **absolute real `python.exe`** (skips the MS-Store stub +
-  unrefreshed PATH — both were silent-failure bugs) and bakes it into a user-ACL'd `run.cmd`
-  launcher (carries the env so the token isn't world-readable — the Win analogue of `chmod 600`).
-  Registers a **Scheduled Task** (no NSSM dep) that runs **as the current user, never SYSTEM**
-  (so it sees the user's Python/engine): S4U @startup if admin (no login needed), else @logon;
-  restart-on-fail. **If the Task Scheduler is denied** (locked-down standard users can't write the
-  root task folder → "Access is denied"), it **falls back to an HKCU `…\Run` key** + a hidden
-  `launch.vbs` (no admin, logon-start) instead of failing. winget installs are **per-user scope**
-  (avoids the UAC prompt that machine-scope triggers). The agent is registered+started **before**
-  the slow hosting prereqs (Git/Podman) so the bot sees it even if those hang. Install dir is
-  per-user `%LOCALAPPDATA%\mc-spawn-agent`.
+- `install.ps1` — **Windows** PowerShell installer. Reads `CONTROL_URL`/`TOKEN` from env
+  (`irm … | iex`); installs **Python 3** per-user via **winget** to run the agent — resolving an
+  **absolute real `python.exe`** (skips the MS-Store stub + unrefreshed PATH, both silent-failure
+  bugs) baked into a user-ACL'd `run.cmd` launcher. Registers autostart **as the current user,
+  never SYSTEM**: a **Scheduled Task** (S4U @startup if admin, else @logon), or — if the root task
+  folder is denied (locked-down standard users → "Access is denied") — an **HKCU `…\Run` key** +
+  hidden `launch.vbs`. **Hosting = a dedicated WSL2 distro** (`mc-spawn`, name overridable): if WSL
+  isn't enabled it prints the ONE admin step (`wsl --install` + reboot) and stops gracefully (agent
+  already enrolled); else it imports a small Ubuntu rootfs (`MCSPAWN_WSL_ROOTFS_URL`, no Store) via
+  `wsl --import`, installs `docker.io` inside as root, sets `/etc/wsl.conf` `[boot] command=service
+  docker start`, and **verifies `docker info`**. No Podman, no Docker Desktop, no Git-Bash. winget
+  is per-user scope (no UAC); the agent registers+starts **before** the slow WSL setup so the bot
+  sees it regardless. Install dir per-user `%LOCALAPPDATA%\mc-spawn-agent`.
 - `mc-spawn-agent.service` — reference systemd unit (install.sh generates the real
   one per backend; all exec `run.sh`).
 - `tests/test_agent.py` — pure: shell executor, `_execute` dispatch, RCON soft-error path,
@@ -60,12 +59,13 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
 The agent is part of the BYOS goal: run on the user's **own hardware, Linux AND
 Windows**. Status:
 
-- **Windows support (PLAN Phase 6) — ✅ DONE.** `install.ps1` (PowerShell, parallel to
-  `install.sh`), run as a **Scheduled Task** (no NSSM dep) instead of systemd/OpenRC, verifies
-  **Docker Desktop / WSL2**, OS-aware paths/shell/playit-networking. Same outbound-only protocol —
-  no inbound ports on the box either OS. **Live-verify on a real Windows box:** the Scheduled-Task
-  registration and the playit `host.docker.internal` path are the unproven bits (the playit local
-  origin may need an IP, not a hostname → `PLAYIT_LOCAL_IP` override exists).
+- **Windows support — ✅ DONE, hosting via WSL.** `install.ps1` (parallel to `install.sh`): runs the
+  agent as a user-owned Scheduled Task / HKCU Run-key (no NSSM), and for hosting sets up a dedicated
+  **WSL2 distro `mc-spawn`** with Docker inside (`wsl --import` an Ubuntu rootfs, no Store/Desktop/
+  Podman). `_shell_argv` routes engine commands through `wsl -d <distro>` so servers run "as on
+  Ubuntu." No admin except the one-time `wsl --install` on a box without WSL. Same outbound-only
+  protocol, no inbound ports. **Live-verify on a real Windows box:** see the Windows live-verify note
+  below.
 - **Versioned protocol → drop-in compiled binary.** `agent.py` stays **stdlib-only** so a
   Go/compiled rewrite is drop-in behind the **same HTTP protocol**. The agent stamps
   `PROTOCOL_VERSION` (currently **1**) + platform on every call (header; also enroll body) so
@@ -119,12 +119,14 @@ bad/old value (e.g. `"mc-spawn-agent 1"`) is stored as the agent's version and l
 default `"playit 1.0.9"` — bump as playit's minimum rises);
 `POST /claim/exchange {code}` → `{secret_key}` (after UserAccepted);
 `POST /v1/agents/rundata` (auth `Authorization: Agent-Key <secret>`) → `{agent_id, tunnels:[{display_address}], pending:[]}`;
-`POST /tunnels/create` (same Agent-Key auth) `{name, tunnel_type:"minecraft-java", port_type:"tcp", port_count:1, origin:{type:"agent", data:{agent_id, local_ip:<_playit_local_ip()>, local_port}}, enabled:true, alloc:null, firewall_id:null, proxy_protocol:null}` → `{id}` (errors are bare enum strings, e.g. `"RequiresVerifiedAccount"`). `local_ip` is `127.0.0.1` on Linux (playit runs `--network host`) and `host.docker.internal` on Win/mac Docker Desktop (override `PLAYIT_LOCAL_IP`). Wire format verified against playit-agent's `api_client` crate.
+`POST /tunnels/create` (same Agent-Key auth) `{name, tunnel_type:"minecraft-java", port_type:"tcp", port_count:1, origin:{type:"agent", data:{agent_id, local_ip:<_playit_local_ip()>, local_port}}, enabled:true, alloc:null, firewall_id:null, proxy_protocol:null}` → `{id}` (errors are bare enum strings, e.g. `"RequiresVerifiedAccount"`). `local_ip` is `127.0.0.1` on both OSes (playit runs `--network host` inside Linux — the WSL distro on Windows; override `PLAYIT_LOCAL_IP`). Wire format verified against playit-agent's `api_client` crate.
 `POST /tunnels/delete` (same Agent-Key auth) `{tunnel_id}` → used by `teardown`; the agent deletes only tunnels named `mc-spawn` (the ones it created), never the user's own.
 The user links their **own** playit account (claim flow); the secret is stored
 `chmod 600` on the box and **never** sent to the control plane. playit runs as a
-docker container (`ghcr.io/playit-cloud/playit-agent`) — **host network on Linux**, or
-bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net_args`).
+docker container (`ghcr.io/playit-cloud/playit-agent`) on the **host network** with
+local IP `127.0.0.1` — on both OSes, because on Windows it runs inside the WSL distro
+(just Linux). The engine command goes through `_run_shell` (→ WSL on Windows), not a
+direct subprocess (`_playit_net_args`/`_playit_local_ip`/`_playit_run`/`_playit_teardown`).
 
 ## Key invariants
 
@@ -173,48 +175,50 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
    no `/agents/delete`; it's a dashboard/account-session action, and we only hold the agent
    *secret*). So after teardown the (now offline, tunnel-less) agent entry remains in the
    user's playit account — harmless; the bot tells the user they can remove it manually.
-10. **Cross-platform (Linux + Windows), one codebase.** OS differences are isolated to small
-    helpers — `_default_state_path` (paths), `_shell_argv` (shell: `bash -c`, or `cmd /c` on
-    Windows lacking bash; the bot's scripts are POSIX so **bash is required for hosting** on
-    Windows — `install.ps1` pulls Git-for-Windows), `_playit_net_args`/`_playit_local_ip` (Linux
-    host-net + `127.0.0.1`; Win/mac Docker-Desktop bridge + `host.docker.internal`). **MC hosting
-    + RCON are already OS-agnostic** because provisioning publishes ports (`-p`), which Docker
-    Desktop maps to the host's localhost. Don't sprinkle `if IS_WINDOWS` through logic — add a
-    helper. `install.sh` (POSIX) and `install.ps1` (Scheduled Task) are the two installers.
+10. **Cross-platform (Linux + Windows), one codebase — Windows hosting runs in WSL.** On Linux
+    the agent runs the engine directly. On **Windows, hosting runs inside a dedicated WSL2 distro**
+    (`mc-spawn`, `WSL_DISTRO`): `_shell_argv` routes every script through `wsl -d <distro> -- bash
+    -lc` (override with `AGENT_SHELL`), so it is "just Linux" there — provisioning, reconcile,
+    lifecycle, `_uninstall`, and playit all flow through that one seam. Hence `_runtime()` → `docker`
+    on Windows (engine is in the distro, not on the Windows PATH) and `_playit_net_args`/
+    `_playit_local_ip` are **Linux semantics on both** (`--network host` + `127.0.0.1`). RCON + the
+    MC port reach the Windows side because WSL2 forwards published container ports to Windows
+    `localhost`. The only Windows-native helper left is `_default_state_path` (paths) + autostart.
+    Don't sprinkle `if IS_WINDOWS` through logic — keep it in `_shell_argv`/`_ensure_engine_ready`.
+    `install.sh` (POSIX) and `install.ps1` (WSL setup) are the two installers.
 11. **Versioned protocol for a drop-in binary.** Every `_http` call stamps `X-MC-Spawn-Protocol`
     (`PROTOCOL_VERSION`, currently 1) + `X-MC-Spawn-Platform`; enroll also sends them in the body.
     The control plane stores `platform`/`protocol_version` on the machine row. This freezes the
     contract so a future Go/compiled agent is a drop-in and the bot can branch on platform if ever
     needed. **Bump `PROTOCOL_VERSION` only on a breaking wire change, and update both repos together.**
-12. **Engine-agnostic; idempotent; auto-reconnect (Phase 6.5).** `_runtime()` auto-detects the
-    container engine (`docker → podman → nerdctl`, `CONTAINER_RUNTIME` overrides) and is exported to
-    every bot script as `$MCSPAWN_RT` (so the bot's `provisioner.py` commands stay engine-agnostic);
-    the agent's own playit commands call `_runtime()` directly. The poll loop now **backs off on 5xx/
-    unexpected** statuses too (not just network errors), so a control-plane restart or CF blip is
-    ridden out instead of hammered. **The agent stays a dumb executor** — it does NOT decide what
-    should run; the bot's reconciler pushes `start`/recreate/`playit_start` to close drift, and the
+12. **Engine-agnostic; idempotent; auto-reconnect (Phase 6.5).** `_runtime()` resolves the engine
+    (`CONTAINER_RUNTIME` overrides; Linux auto-detects `docker → podman → nerdctl`; Windows = `docker`
+    in the WSL distro) and is exported to every bot script as `$MCSPAWN_RT`, so `provisioner.py`
+    commands stay engine-agnostic. The poll loop **backs off on 5xx/unexpected** statuses too (not
+    just network errors), so a control-plane restart or CF blip is ridden out. **The agent stays a
+    dumb executor** — the bot's reconciler pushes `start`/recreate/`playit_start` to close drift, and
     recreate reattaches the `<container>_data` volume so the world survives a manual `docker rm`.
-    **Windows/podman:** containers live in a WSL2 "podman machine" that does NOT auto-start at
-    logon/boot, so `_ensure_engine_ready()` runs `podman machine start` (idempotent, once per
-    process) before the first container command — otherwise every container is down after a restart
-    and `podman` reports "Cannot connect". It only *starts* (never `init`s — creating the VM is slow
-    and is the installer's job); a missing machine is logged with the manual fix.
+    **Windows engine bootstrap:** the WSL distro and its dockerd don't auto-start at logon/boot, so
+    `_ensure_engine_ready()` runs `wsl -d <distro> -- service docker start` (idempotent, once per
+    process) before the first container command — otherwise everything is down after a restart. It
+    only *starts* (never imports/installs — that's the installer's slow one-time job); a missing
+    distro is logged with the fix.
 13. **Full self-uninstall on machine delete.** The `uninstall` `{containers}` command purges the
     listed MC containers + their `_data` volumes and tears down playit **synchronously**, then spawns
     a **detached** cleanup (systemd-run / new-session `sh`, or PowerShell on Windows) that removes the
-    service/Scheduled-Task (+ the HKCU `…\Run` fallback value on Windows) + the agent's own files a few seconds later — surviving the agent's death
-    when its service is stopped (and the agent.py file-lock on Windows). The agent reports the result
-    then `sys.exit(0)` so the (being-removed) service doesn't relaunch it. Best-effort + idempotent.
-    The launchers (`run.sh`/`run.cmd`) **re-fetch `agent.py` from `AGENT_RAW` if it was deleted**, so
-    a manually-removed binary self-heals on the next service restart. **Live-verify:** service removal
-    + Windows Scheduled-Task delete need a real box (the cgroup/file-lock timing is the unproven bit).
-    **All engine commands run through the shell, not direct subprocess.** On Windows when `bash` is
-    `System32\bash.exe` (WSL launcher, e.g. no Git-Bash), the bot's scripts — and the container
-    engine they invoke — execute INSIDE the default WSL distro (the server lives in WSL's Docker, not
-    Windows). So `_uninstall` purges containers via `_run_shell` (`${MCSPAWN_RT:-docker}`), matching
-    how they were created; a direct `subprocess([rt,…])` would target a Windows engine that isn't
-    there and orphan them. (Known gap: the playit container ops still call the engine directly, so
-    playit teardown is unreliable on a WSL-Docker Windows box — fix when revisiting playit.)
+    service/Scheduled-Task (+ the HKCU `…\Run` fallback value on Windows) + the agent's own files a few
+    seconds later — surviving the agent's death when its service is stopped (and the agent.py file-lock
+    on Windows). On Windows it also `wsl --unregister`s the `mc-spawn` distro — one shot wipes every
+    container, volume, and Docker inside it. The agent reports the result then `sys.exit(0)` so the
+    (being-removed) service doesn't relaunch it. Best-effort + idempotent. The launchers
+    (`run.sh`/`run.cmd`) **re-fetch `agent.py` from `AGENT_RAW` if it was deleted**, so a manually-
+    removed binary self-heals on the next service restart. **Live-verify:** service/task removal +
+    distro unregister need a real box (cgroup/file-lock timing is the unproven bit).
+    **All engine commands run through the shell, not direct subprocess** (`_shell_argv` → `wsl` on
+    Windows): `_uninstall` purges via `_run_shell` and `_playit_run`/`_playit_teardown` build a
+    `${MCSPAWN_RT:-docker}` script too, so they hit the SAME engine (the WSL distro's Docker) that
+    created the containers — a direct `subprocess([rt,…])` would target a Windows-side engine that
+    isn't there and orphan them.
 
 > **Live-verify note:** the playit claim handshake + tunnel create/delete/address read can
 > only be fully confirmed on a real box with a real playit account — not in CI. Verified
@@ -224,14 +228,15 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
 > default `"playit 1.0.9"`, and treat a transient `AgentVersionTooOld` as retryable). The
 > pure dispatch/parse paths are unit-tested; the end-to-end browser flow needs one hands-on pass.
 
-> **Windows live-verify note (Phase 6):** the OS-aware helpers are unit-tested (by patching
-> `IS_WINDOWS`), but a real Windows box must confirm: (1) `install.ps1` winget installs + the
-> Scheduled-Task registration runs **as the user** (S4U @startup / Interactive @logon) and actually
-> launches the agent — the prior SYSTEM task couldn't find the per-user Python, so it died silently;
-> (2) Podman: `winget install RedHat.Podman` + `podman machine init/start` succeeding (needs WSL2),
-> the agent reaching `podman.exe`, and the bot's POSIX scripts running via Git-Bash with
-> `$MCSPAWN_RT=podman`; (3) playit forwarding to `host.docker.internal:<mc_port>` (podman-on-WSL may
-> not provide that host alias → set `PLAYIT_LOCAL_IP` to the WSL/host IP).
+> **Windows live-verify note (WSL path):** the OS-aware helpers are unit-tested (by patching
+> `IS_WINDOWS`), but a real Windows box must confirm: (1) `install.ps1` registers autostart **as the
+> user** (S4U @startup / @logon, or HKCU Run-key fallback) and launches the agent; (2) the WSL setup
+> — `wsl --import mc-spawn` from the Ubuntu rootfs URL, `docker.io` install, `/etc/wsl.conf` boot
+> command, `docker info` OK — and that `_shell_argv`'s `wsl -d mc-spawn -- bash -lc …` runs the bot's
+> scripts inside it; (3) RCON + MC port reaching Windows `localhost` via WSL2 port forwarding;
+> (4) playit (`--network host`, `127.0.0.1`) inside the distro; (5) machine delete → `wsl --unregister
+> mc-spawn` wipes it. The one unavoidable admin step is enabling WSL (`wsl --install`) on a box
+> without it.
 
 ## Logging / debug
 
