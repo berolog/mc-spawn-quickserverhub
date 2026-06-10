@@ -208,6 +208,13 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
     The launchers (`run.sh`/`run.cmd`) **re-fetch `agent.py` from `AGENT_RAW` if it was deleted**, so
     a manually-removed binary self-heals on the next service restart. **Live-verify:** service removal
     + Windows Scheduled-Task delete need a real box (the cgroup/file-lock timing is the unproven bit).
+    **All engine commands run through the shell, not direct subprocess.** On Windows when `bash` is
+    `System32\bash.exe` (WSL launcher, e.g. no Git-Bash), the bot's scripts — and the container
+    engine they invoke — execute INSIDE the default WSL distro (the server lives in WSL's Docker, not
+    Windows). So `_uninstall` purges containers via `_run_shell` (`${MCSPAWN_RT:-docker}`), matching
+    how they were created; a direct `subprocess([rt,…])` would target a Windows engine that isn't
+    there and orphan them. (Known gap: the playit container ops still call the engine directly, so
+    playit teardown is unreliable on a WSL-Docker Windows box — fix when revisiting playit.)
 
 > **Live-verify note:** the playit claim handshake + tunnel create/delete/address read can
 > only be fully confirmed on a real box with a real playit account — not in CI. Verified

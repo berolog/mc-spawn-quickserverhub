@@ -339,20 +339,21 @@ class RconErrorPathTests(unittest.TestCase):
 
 class UninstallTests(unittest.TestCase):
     def test_uninstall_purges_containers_teardowns_playit_and_spawns_cleanup(self):
-        runs = []
-        with mock.patch.object(agent, "_runtime", return_value="docker"), \
-             mock.patch.object(agent.subprocess, "run",
-                               side_effect=lambda a, **k: runs.append(a)), \
+        scripts = []
+        with mock.patch.object(agent, "_run_shell",
+                               side_effect=lambda p: scripts.append(p["script"]) or {"exit": 0}), \
              mock.patch.object(agent, "_playit_teardown") as teardown, \
              mock.patch.object(agent, "_spawn_self_cleanup") as cleanup:
             res = agent._uninstall({"containers": ["mcw-1", "mcw-2"]})
         self.assertEqual(res["status"], "ok")
         teardown.assert_called_once()
         cleanup.assert_called_once()
-        # each container: rm -f + volume rm
-        self.assertIn(["docker", "rm", "-f", "mcw-1"], runs)
-        self.assertIn(["docker", "volume", "rm", "mcw-1_data"], runs)
-        self.assertIn(["docker", "rm", "-f", "mcw-2"], runs)
+        blob = "\n".join(scripts)
+        # purge runs through the shell (so it reaches the same engine, incl. WSL on Windows)
+        self.assertIn("rm -f mcw-1", blob)
+        self.assertIn("volume rm mcw-1_data", blob)
+        self.assertIn("rm -f mcw-2", blob)
+        self.assertIn("${MCSPAWN_RT:-docker}", blob)
 
     def test_execute_dispatches_uninstall(self):
         with mock.patch.object(agent, "_uninstall", return_value={"status": "ok"}) as u:

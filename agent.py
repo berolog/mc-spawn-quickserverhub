@@ -162,9 +162,12 @@ def _ensure_engine_ready():
 def _shell_argv(script):
     """Pick the shell to run a bot-issued script. The bot emits POSIX `docker` one-
     liners (see provisioner.py), so we need a POSIX shell. On Linux that's `bash`.
-    On Windows, Docker Desktop ships with WSL/Git-Bash so `bash` is normally on PATH —
-    prefer it; fall back to `cmd /c` only if there's genuinely no bash (the docker
-    commands themselves are largely shell-agnostic). Override with AGENT_SHELL."""
+    On Windows `bash` is either Git-Bash OR `C:\\Windows\\System32\\bash.exe` (the WSL
+    launcher) — and if it's the latter the script (and thus the container engine it calls)
+    runs INSIDE the default WSL distro, where Docker/podman actually live. That's why the
+    agent's own engine commands must also go through this shell, not a direct subprocess
+    (which would hit a Windows-side engine that may not exist). Falls back to `cmd /c`
+    only if there's genuinely no bash. Override with AGENT_SHELL."""
     override = os.environ.get("AGENT_SHELL")
     if override:
         return [override, "-c", script]
@@ -627,13 +630,15 @@ SERVICE_NAME = "mc-spawn-agent"
 
 
 def _uninstall(payload):
-    rt = _runtime()
     for c in payload.get("containers", []):
-        for args in ([rt, "rm", "-f", c], [rt, "volume", "rm", f"{c}_data"]):
-            try:
-                subprocess.run(args, capture_output=True, text=True, timeout=60)
-            except Exception:  # noqa: BLE001
-                pass
+        # Run via the SAME shell as provisioning (`_run_shell` → bash; on Windows without
+        # Git-Bash that's `bash.exe` = WSL, where the engine actually lives). A direct
+        # subprocess([rt, ...]) here would call a Windows docker/podman that doesn't exist
+        # on a WSL-Docker box and orphan the containers. `${MCSPAWN_RT:-docker}` resolves
+        # the engine exactly like the bot's scripts do.
+        _run_shell({"script":
+            f"${{MCSPAWN_RT:-docker}} rm -f {c} 2>/dev/null; "
+            f"${{MCSPAWN_RT:-docker}} volume rm {c}_data 2>/dev/null; true"})
     _playit_teardown()
     try:
         _spawn_self_cleanup()
