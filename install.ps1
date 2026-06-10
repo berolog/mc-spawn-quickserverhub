@@ -229,9 +229,10 @@ function Setup-WslHosting {
         & wsl -d $WslDistro -- sh -lc 'service docker start >/dev/null 2>&1; docker info >/dev/null 2>&1'
         if ($LASTEXITCODE -eq 0) { Log "WSL hosting ready (distro '$WslDistro')"; return }
     } else {
-        Log "creating the '$WslDistro' WSL distro (downloads a small Ubuntu rootfs)…"
+        Log "creating the '$WslDistro' WSL distro (downloads the Ubuntu 24.04 WSL rootfs)…"
+        $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
         $rootfsUrl = if ($env:MCSPAWN_WSL_ROOTFS_URL) { $env:MCSPAWN_WSL_ROOTFS_URL } `
-                     else { 'https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz' }
+                     else { "https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-$arch-wsl.rootfs.tar.gz" }
         $tar = Join-Path $Dir 'distro-rootfs.tar.gz'
         $distroDir = Join-Path $Dir 'wsl'
         New-Item -ItemType Directory -Force -Path $distroDir | Out-Null
