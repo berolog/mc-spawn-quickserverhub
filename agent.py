@@ -141,13 +141,12 @@ _ENGINE_READY = False
 
 
 def _ensure_engine_ready():
-    """On Windows the engine lives in the WSL distro, and neither the distro nor its dockerd
-    auto-start at logon/boot — so after a restart every container is down and `docker` is
-    unreachable. Start the distro + dockerd once per agent process before the first container
-    command (idempotent; `wsl -d <distro> -- service docker start` boots the distro and the
-    daemon). We do NOT import the distro or install docker here: that's the installer's slow,
-    one-time job; if the distro is missing this fails fast and the next command's stderr makes
-    the cause obvious. No-op on Linux."""
+    """On Windows the engine lives in the WSL distro; start it + dockerd once per agent process
+    before the first container command and WAIT for the socket (idempotent). Tries the systemd
+    unit, then SysV, then `dockerd` directly — whichever the distro has — since neither the
+    distro nor the daemon auto-start reliably across reboots. We do NOT import the distro or
+    install docker here: that's the installer's slow one-time job; if the distro is missing this
+    fails fast and the next command's stderr makes the cause obvious. No-op on Linux."""
     global _ENGINE_READY
     if _ENGINE_READY:
         return
@@ -158,8 +157,9 @@ def _ensure_engine_ready():
         # Start dockerd and wait for its socket (it takes a few seconds), so the very next
         # container command doesn't race a not-yet-listening daemon. Exits 0 once `docker
         # info` succeeds, non-zero if it never comes up.
-        wait = ("service docker start >/dev/null 2>&1; i=0; "
-                "while [ $i -lt 30 ]; do docker info >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done; exit 1")
+        wait = ("(systemctl start docker || service docker start || "
+                "(dockerd >/tmp/mcspawn-dockerd.log 2>&1 &)) >/dev/null 2>&1; i=0; "
+                "while [ $i -lt 40 ]; do docker info >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done; exit 1")
         r = subprocess.run(
             ["wsl", "-d", WSL_DISTRO, "--", "sh", "-lc", wait],
             capture_output=True, text=True, timeout=180)

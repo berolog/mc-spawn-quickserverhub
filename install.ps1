@@ -274,10 +274,10 @@ function Setup-WslHosting {
         }
     }
 
-    # Install Docker inside the distro (root → no admin, no password) and make it start on
-    # every distro boot via /etc/wsl.conf (no systemd dependency). Then restart + verify.
-    # iptables-legacy: dockerd can't program nftables on the WSL2 kernel (a well-known
-    # gotcha), so containers would get no networking — switch to legacy before starting.
+    # Install Docker inside the distro (root → no admin, no password). Boot the distro with
+    # **systemd** so Docker's unit autostarts and `systemctl` works — Docker ships a systemd
+    # unit, not a SysV init script (so `service docker` doesn't exist on modern packages).
+    # iptables-legacy: dockerd can't program nftables on the WSL2 kernel — switch to legacy.
     Log 'installing Docker inside the distro (one-time)…'
     $setupOut = Wsl-RunScript @'
 set -e
@@ -285,25 +285,28 @@ export DEBIAN_FRONTEND=noninteractive
 if ! command -v docker >/dev/null 2>&1; then apt-get update && apt-get install -y docker.io iptables; fi
 update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
 update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null || true
-printf '[boot]\ncommand=service docker start\n' > /etc/wsl.conf
+printf '[boot]\nsystemd=true\n' > /etc/wsl.conf
+systemctl enable docker 2>/dev/null || true
 '@
-    & wsl --terminate $WslDistro 2>&1 | Out-Null   # apply /etc/wsl.conf boot command
+    & wsl --terminate $WslDistro 2>&1 | Out-Null   # reboot so systemd (and enabled docker) come up
 
-    # Start dockerd and WAIT for its socket (the daemon needs a few seconds), so a single
-    # immediate `docker info` doesn't false-negative. On failure the script prints the real
-    # error and exits 1, so it's diagnosable instead of a vague warning.
+    # Start Docker (systemd unit → SysV → dockerd directly, whichever the distro has) and WAIT
+    # for its socket. On failure print the real reason (docker info + daemon log) so it's
+    # diagnosable, not a vague warning.
     $out = Wsl-RunScript @'
-service docker start >/dev/null 2>&1
+(systemctl start docker || service docker start || (dockerd >/tmp/mcspawn-dockerd.log 2>&1 &)) >/dev/null 2>&1
 i=0
-while [ $i -lt 30 ]; do docker info >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done
+while [ $i -lt 40 ]; do docker info >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done
 echo "=== docker did not start ==="
-docker info 2>&1 | tail -n 25
+docker info 2>&1 | tail -n 20
+journalctl -u docker --no-pager 2>/dev/null | tail -n 20
+tail -n 20 /tmp/mcspawn-dockerd.log 2>/dev/null
 exit 1
 '@
     if ($LASTEXITCODE -eq 0) {
         Log "WSL hosting ready (distro '$WslDistro')"
     } else {
-        Warn "Docker did not come up in '$WslDistro'. Details below; re-run, or inspect with: wsl -d $WslDistro -- bash -c 'service docker start; docker info'"
+        Warn "Docker did not come up in '$WslDistro'. Details below; re-run, or inspect with: wsl -d $WslDistro -- bash -c 'systemctl start docker; docker info'"
         @($setupOut + $out | Select-Object -Last 30) | ForEach-Object { Warn "  $_" }
     }
 }
