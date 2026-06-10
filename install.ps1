@@ -251,8 +251,12 @@ function Setup-WslHosting {
     # Install Docker inside the distro (root → no admin, no password) and make it start on
     # every distro boot via /etc/wsl.conf (no systemd dependency). Then restart + verify.
     Log 'installing Docker inside the distro (one-time)…'
+    # iptables-legacy: dockerd can't program nftables on the WSL2 kernel (a well-known
+    # gotcha), so containers would get no networking — switch to legacy before starting.
     $setup = 'export DEBIAN_FRONTEND=noninteractive; ' +
-             'command -v docker >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq docker.io; }; ' +
+             'command -v docker >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq docker.io iptables; }; ' +
+             'update-alternatives --set iptables /usr/sbin/iptables-legacy >/dev/null 2>&1 || true; ' +
+             'update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy >/dev/null 2>&1 || true; ' +
              'printf ''[boot]\ncommand=service docker start\n'' > /etc/wsl.conf; ' +
              'service docker start >/dev/null 2>&1 || true'
     & wsl -d $WslDistro -- sh -lc $setup 2>&1 | Out-Null
