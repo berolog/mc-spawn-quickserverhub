@@ -150,6 +150,7 @@ cat > "$RUN" <<EOF
 export CONTROL_URL="$CONTROL_URL"
 export TOKEN="$TOKEN"
 export AGENT_STATE="$STATE/cred.json"
+export MCSPAWN_DEBUG="${MCSPAWN_DEBUG:-}"
 # Self-heal (Phase 6.5): if the user deleted agent.py by hand, re-fetch it before
 # launch so the service recovers on its next restart instead of crash-looping.
 if [ ! -f "$DIR/agent.py" ]; then
@@ -244,17 +245,19 @@ install_fallback() {
   if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
     kill "$(cat "$pidfile")" 2>/dev/null || true
   fi
-  nohup "$RUN" >"$STATE/agent.log" 2>&1 &
+  # Redirect raw stdout/stderr to agent.out (crash-capture). The agent also keeps its
+  # own structured log at $STATE/agent.log — that's the one to read.
+  nohup "$RUN" >"$STATE/agent.out" 2>&1 &
   echo $! > "$pidfile"
   if command -v crontab >/dev/null 2>&1; then
-    cron_line="@reboot $RUN >>$STATE/agent.log 2>&1"
+    cron_line="@reboot $RUN >>$STATE/agent.out 2>&1"
     ( crontab -l 2>/dev/null | grep -vF "$RUN"; echo "$cron_line" ) | crontab - 2>/dev/null \
       && log "added @reboot crontab entry for restart-on-boot" \
       || warn "could not install crontab entry — agent won't auto-start after reboot"
   else
     warn "no service manager and no crontab — agent runs now but won't auto-start after reboot"
   fi
-  log "running via nohup (logs: $STATE/agent.log)"
+  log "running via nohup (log: $STATE/agent.log)"
 }
 
 if [ "$ROOT" = 1 ] && command -v systemctl >/dev/null 2>&1; then
@@ -268,3 +271,5 @@ else
 fi
 
 log "mc-spawn agent installed and started. Управление — в Telegram-боте."
+log "agent log: $STATE/agent.log   (tail -f $STATE/agent.log)"
+log "verbose:   re-run the installer with  MCSPAWN_DEBUG=1  prepended"

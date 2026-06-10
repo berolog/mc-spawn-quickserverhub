@@ -104,6 +104,9 @@ CONTROL_URL=http://127.0.0.1:8080 TOKEN=<token> AGENT_STATE=/tmp/cred.json pytho
 | `TOKEN` | first run only | — | One-time enroll token from the bot (ignored once enrolled). |
 | `AGENT_STATE` | no | `/etc/mc-spawn-agent/cred.json` (root) or `~/.config/mc-spawn-agent/cred.json` (rootless) | Where the long-lived secret is stored. |
 | `AGENT_RAW` | no | this repo's GitHub raw | Base URL `agent.py` is fetched from (forks / pinned commits). |
+| `AGENT_LOG` | no | `agent.log` next to the cred file | Where the agent appends its log (it runs detached, so this file is how you see what it did). |
+| `MCSPAWN_DEBUG` | no | off | `1` ⇒ verbose logs (engine detection, per-command output). Secrets/script text are never logged. |
+| `CONTAINER_RUNTIME` | no | auto (`docker`→`podman`→`nerdctl`) | Force a specific container engine. |
 
 ## Manage
 
@@ -121,6 +124,29 @@ Rootless systemd `--user`: same commands with `--user`; state lives in
 `rc-service mc-spawn-agent {status,stop}`, `rc-update del mc-spawn-agent`. Nohup
 fallback: `kill "$(cat ~/.config/mc-spawn-agent/agent.pid)"` and remove the
 `@reboot` crontab line.
+
+## Logs & debugging
+
+The agent runs detached (systemd / hidden Scheduled-Task / Run-key), so it appends to a
+log file — read that to see what it's doing:
+
+```bash
+# Linux
+tail -f ~/.config/mc-spawn-agent/agent.log      # or /etc/mc-spawn-agent/agent.log (root)
+journalctl -u mc-spawn-agent -f                  # systemd backends also log to the journal
+```
+```powershell
+# Windows
+Get-Content "$env:LOCALAPPDATA\mc-spawn-agent\agent.log" -Wait
+```
+
+The startup line shows the platform, the **chosen container engine**, and all paths.
+Failed shell commands log their exit code + the engine's stderr (e.g. *"Cannot connect to
+Podman"*), so engine/connection problems are obvious. For verbose output (engine
+detection, per-command stdout) set `MCSPAWN_DEBUG=1` — re-run the installer with it
+prepended, e.g. `MCSPAWN_DEBUG=1 CONTROL_URL=… TOKEN=… sh` (Linux) or
+`$env:MCSPAWN_DEBUG=1` before the PowerShell one-liner. The agent never logs secrets or
+the provisioning script (it carries the RCON password).
 
 ## Tests
 

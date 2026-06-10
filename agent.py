@@ -66,9 +66,40 @@ SHELL_TIMEOUT = 600      # provisioning (docker pull) can be slow
 # Cloudflare hostname, so send a real product UA or enroll/poll never get through.
 USER_AGENT = "mc-spawn-agent/1.0"
 
+# Observability. The agent normally runs detached (systemd / hidden Scheduled-Task /
+# Run-key wscript) with no visible console, so it also appends to a log FILE — that's
+# how you see what it actually did. `MCSPAWN_DEBUG=1` adds verbose lines (full command
+# output, runtime detection). Secrets (token/secret/RCON+playit passwords) and the
+# provisioning script text (which carries the RCON password) are NEVER written.
+DEBUG = os.environ.get("MCSPAWN_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
+LOG_PATH = os.environ.get("AGENT_LOG") or os.path.join(
+    os.path.dirname(STATE_PATH) or ".", "agent.log")
+_LOG_CAP = 1_000_000     # bytes; reset the file past this so it can't grow unbounded
+
+
+def _log_to_file(line):
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH) or ".", exist_ok=True)
+        try:
+            if os.path.getsize(LOG_PATH) > _LOG_CAP:
+                open(LOG_PATH, "w").close()
+        except OSError:
+            pass
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+    except Exception:  # noqa: BLE001 — logging must never break the agent
+        pass
+
 
 def _log(msg):
-    print(f"[mc-spawn-agent] {msg}", flush=True)
+    line = f"[mc-spawn-agent] {msg}"
+    print(line, flush=True)
+    _log_to_file(line)
+
+
+def _debug(msg):
+    if DEBUG:
+        _log(f"[debug] {msg}")
 
 
 _RUNTIME_CACHE = None
@@ -88,9 +119,9 @@ def _runtime():
     if override:
         _RUNTIME_CACHE = override
     else:
-        _RUNTIME_CACHE = next(
-            (rt for rt in ("docker", "podman", "nerdctl") if shutil.which(rt)), "docker"
-        )
+        found = {rt: shutil.which(rt) for rt in ("docker", "podman", "nerdctl")}
+        _RUNTIME_CACHE = next((rt for rt, p in found.items() if p), "docker")
+        _debug(f"runtime detect: {found} -> {_RUNTIME_CACHE}")
     return _RUNTIME_CACHE
 
 
@@ -173,15 +204,26 @@ def _run_shell(payload):
         # Expose the detected container engine to the bot's POSIX scripts as $MCSPAWN_RT
         # (they call `${MCSPAWN_RT:-docker} …`), so one script set runs on docker/podman/
         # nerdctl without the bot knowing what's installed on the box (Phase 6.5).
-        env = {**os.environ, "MCSPAWN_RT": _runtime()}
+        rt = _runtime()
+        env = {**os.environ, "MCSPAWN_RT": rt}
+        argv = _shell_argv(payload["script"])
         p = subprocess.run(
-            _shell_argv(payload["script"]),
-            capture_output=True, text=True, timeout=SHELL_TIMEOUT, env=env,
+            argv, capture_output=True, text=True, timeout=SHELL_TIMEOUT, env=env,
         )
+        # Log the OUTCOME (exit + stderr tail), never the script — it carries the RCON
+        # password. stderr from the engine is safe and is exactly what you need to see a
+        # failure like "Cannot connect to Podman" or "image not found".
+        if p.returncode not in (0, None):
+            _log(f"shell exit={p.returncode} via {argv[0]} rt={rt}; "
+                 f"stderr={p.stderr.strip()[-600:]!r}")
+        else:
+            _debug(f"shell ok via {argv[0]} rt={rt}; stdout={p.stdout.strip()[-600:]!r}")
         return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]}
     except subprocess.TimeoutExpired:
+        _log(f"shell timeout after {SHELL_TIMEOUT}s")
         return {"exit": None, "stdout": "", "stderr": "timeout"}
     except Exception as e:  # noqa: BLE001
+        _log(f"shell failed to launch: {type(e).__name__}: {e}")
         return {"exit": None, "stdout": "", "stderr": type(e).__name__}
 
 
@@ -632,6 +674,9 @@ def _execute(cmd):
 
 
 def main():
+    # Startup banner — first thing in the log so a glance answers "what/where/which engine".
+    _log(f"start: v={USER_AGENT} platform={PLATFORM} runtime={_runtime()} "
+         f"control={CONTROL_URL} state={STATE_PATH} log={LOG_PATH} debug={DEBUG}")
     if not CONTROL_URL:
         _log("CONTROL_URL is required")
         sys.exit(1)

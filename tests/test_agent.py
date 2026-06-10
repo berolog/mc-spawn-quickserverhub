@@ -26,6 +26,27 @@ class AgentShellTests(unittest.TestCase):
         self.assertIn("oops", res["stderr"])
 
 
+class ShellLoggingTests(unittest.TestCase):
+    """A failing command must log its stderr (so 'Cannot connect to Podman' is visible)
+    but NEVER the script text — the provisioning script carries the RCON password."""
+
+    def test_failure_logs_stderr_not_script(self):
+        logged = []
+        with mock.patch.object(agent, "_log", lambda m: logged.append(m)):
+            agent._run_shell({"script": "echo SECRETPASS >&2; exit 7"})
+        blob = "\n".join(logged)
+        self.assertIn("exit=7", blob)
+        self.assertIn("SECRETPASS", blob)          # stderr tail is shown
+        self.assertNotIn("echo SECRETPASS", blob)   # the script itself is not
+
+    def test_success_is_quiet_without_debug(self):
+        logged = []
+        with mock.patch.object(agent, "DEBUG", False), \
+             mock.patch.object(agent, "_log", lambda m: logged.append(m)):
+            agent._run_shell({"script": "exit 0"})
+        self.assertEqual(logged, [])
+
+
 class ExecuteDispatchTests(unittest.TestCase):
     def test_unknown_kind(self):
         status, _res = agent._execute({"kind": "nope", "payload": {}})

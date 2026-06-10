@@ -117,11 +117,13 @@ Invoke-WebRequest -UseBasicParsing -Uri "$AgentRaw/agent.py" -OutFile (Join-Path
 # current user (the Windows analogue of install.sh's chmod 600 on run.sh).
 $Run = Join-Path $Dir 'run.cmd'
 $CredPath = Join-Path $State 'cred.json'
+$DebugFlag = $env:MCSPAWN_DEBUG   # set MCSPAWN_DEBUG=1 before running to get verbose logs
 @"
 @echo off
 set "CONTROL_URL=$ControlUrl"
 set "TOKEN=$Token"
 set "AGENT_STATE=$CredPath"
+set "MCSPAWN_DEBUG=$DebugFlag"
 rem Self-heal (Phase 6.5): re-fetch agent.py if the user deleted it by hand.
 if not exist "$($Dir)\agent.py" powershell -NoProfile -Command "irm '$AgentRaw/agent.py' -OutFile '$($Dir)\agent.py'"
 "$Python" "$($Dir)\agent.py"
@@ -232,4 +234,6 @@ if ((Have docker) -or (Have nerdctl)) {
         Warn 'No container engine yet. To host a server install Podman (`winget install RedHat.Podman`) or Docker Desktop. Monitoring/RCON already work.'
     }
 }
-Log 'done. Управление — в Telegram-боте.'
+Log "done. Управление — в Telegram-боте. Лог агента: $Dir\agent.log"
+Log "посмотреть лог:   Get-Content '$Dir\agent.log' -Wait"
+Log 'подробный лог:    перед запуском установщика задай  $env:MCSPAWN_DEBUG=1'

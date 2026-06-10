@@ -221,6 +221,18 @@ bridge + `--add-host host.docker.internal:host-gateway` on Win/mac (`_playit_net
 > `$MCSPAWN_RT=podman`; (3) playit forwarding to `host.docker.internal:<mc_port>` (podman-on-WSL may
 > not provide that host alias → set `PLAYIT_LOCAL_IP` to the WSL/host IP).
 
+## Logging / debug
+
+The agent runs **detached** (systemd / hidden Scheduled-Task / Run-key), so it appends to a log
+**file** (`AGENT_LOG`, default `agent.log` beside the cred file) as well as stdout — that file is
+how you see what it did. Startup logs platform + **chosen engine** (`_runtime()`) + paths; a failing
+`_run_shell` logs `exit=<n>` + the engine's **stderr tail** (so "Cannot connect to Podman" / "image
+not found" are visible) but **never the script** (it carries the RCON password — inv. 3).
+`MCSPAWN_DEBUG=1` adds verbose lines (engine detection, per-command stdout). `_log` mirrors to the
+file via `_log_to_file` (size-capped, best-effort, never raises); `_debug` is gated on `DEBUG`. The
+installers bake `MCSPAWN_DEBUG` into the launcher; `install.sh` sends raw nohup stdout to `agent.out`
+so `agent.log` stays the clean structured log.
+
 ## Run / test
 
 ```bash
