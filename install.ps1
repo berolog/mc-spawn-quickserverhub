@@ -54,6 +54,25 @@ function Refresh-Path {
                 [Environment]::GetEnvironmentVariable('Path','User')
 }
 
+function Download-File ($url, $dest) {
+    # Why a helper, not a bare Invoke-WebRequest: in **Windows PowerShell 5.1** (the default
+    # shell on Win11) IWR is pathologically slow for large files — it repaints a progress bar
+    # on every chunk and buffers the body in memory, so a 340MB file a browser pulls in seconds
+    # can take 20+ minutes, appearing to hang on "Writing request stream... (bytes written: …)".
+    # Prefer curl.exe (ships in Win10 1803+/Win11: full speed + a real progress bar — note PS's
+    # `curl` is an ALIAS for IWR, so we must spell out curl.exe). Fall back to IWR with the
+    # progress bar OFF, which by itself removes nearly all of the slowdown.
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        & curl.exe -fL --retry 3 -o $dest $url
+        if ($LASTEXITCODE -eq 0) { return }
+        Warn "curl.exe failed (exit $LASTEXITCODE) — retrying with Invoke-WebRequest"
+    }
+    $old = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try { Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dest }
+    finally { $ProgressPreference = $old }
+}
+
 function Winget-Install ($id) {
     if (-not (Have winget)) { return $false }
     Log "installing $id via winget (per-user — no admin prompt)"
@@ -117,7 +136,7 @@ Log "using Python at $Python"
 # ---- fetch agent.py ----
 Log 'fetching agent.py'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -UseBasicParsing -Uri "$AgentRaw/agent.py" -OutFile (Join-Path $Dir 'agent.py')
+Download-File "$AgentRaw/agent.py" (Join-Path $Dir 'agent.py')
 
 # ---- launcher carrying the config (incl. the one-time TOKEN) ----
 # Bakes the ABSOLUTE python path so the task never depends on PATH. ACL'd to the
@@ -262,7 +281,7 @@ function Setup-WslHosting {
         Remove-Item -Recurse -Force $distroDir -ErrorAction SilentlyContinue   # clear any stale vhdx
         New-Item -ItemType Directory -Force -Path $distroDir | Out-Null
         try {
-            Invoke-WebRequest -UseBasicParsing -Uri $rootfsUrl -OutFile $tar
+            Download-File $rootfsUrl $tar
             & wsl --import $WslDistro $distroDir $tar --version 2
             if ($LASTEXITCODE -ne 0) { throw 'wsl --import failed' }
         } catch {
