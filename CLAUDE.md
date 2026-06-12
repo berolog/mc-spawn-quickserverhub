@@ -167,7 +167,12 @@ direct subprocess (`_playit_net_args`/`_playit_local_ip`/`_playit_run`/`_playit_
    bot loops `ensure_tunnel` until `created`/`exists` (the first `POST /tunnels/create` often
    fails `AgentVersionTooOld`/`connecting` while the container connects — that's retryable, not
    fatal), then switches to read-only `status` for the address — so the create is robust AND
-   can't spawn duplicates. `_playit_run` never raises (docker may be absent ⇒ returns False).
+   can't spawn duplicates. **rundata lags a just-created tunnel by a few seconds**, so the
+   name-dedup alone would let a retried/relaunched `ensure_tunnel` (saga resume, or a 2nd bot
+   replica — all funnel to THIS one agent process, run serially) create a SECOND tunnel; an
+   in-memory `_TUNNEL_CREATE_GUARD` (port→ts, 120 s) bridges that gap — once we create for a
+   port we report `created` without a 2nd `/tunnels/create` until rundata shows it (cleared on
+   delete/teardown). `_playit_run` never raises (docker may be absent ⇒ returns False).
 9. **Cleanup of tunnels, but the agent record can't be API-deleted.** `remove_tunnel
    {local_port}` deletes one server's tunnel; `teardown` deletes ALL of ours + stops the
    container + drops the secret. Both filter to tunnels WE created (name `mc-spawn` or

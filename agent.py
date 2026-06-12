@@ -523,6 +523,24 @@ def _playit_run(secret):
     return _run_shell({"script": script}).get("exit") == 0
 
 
+# rundata reflects a just-created tunnel only after a few seconds of propagation. Within that
+# gap a retried/relaunched ensure_tunnel — the bot's acquire loop on resume, or a SECOND bot
+# replica (all of which funnel to THIS one agent process, run serially) — would create a
+# DUPLICATE tunnel. So remember the ports we just created a tunnel for and treat them as done
+# until rundata catches up. In-memory is enough: the agent is the single chokepoint per machine,
+# and a (rare) agent restart within the window self-heals (rundata has caught up by then).
+# Cleared when the tunnel is deleted so a later re-create still works.
+_TUNNEL_CREATE_GUARD: dict[int, float] = {}
+_TUNNEL_CREATE_GUARD_SEC = 120
+
+
+def _recently_created_tunnel(local_port):
+    if not local_port:
+        return False
+    ts = _TUNNEL_CREATE_GUARD.get(int(local_port))
+    return ts is not None and (time.monotonic() - ts) < _TUNNEL_CREATE_GUARD_SEC
+
+
 def _playit(payload):
     """Link/report a server's playit public address. The ops are SMALL and quick so the
     BOT can drive pacing and show live progress (it loops claim_poll / status, editing the
@@ -539,10 +557,13 @@ def _playit(payload):
 
     if op == "teardown":
         _playit_teardown()
+        _TUNNEL_CREATE_GUARD.clear()
         return {"status": "ok"}
     if op == "remove_tunnel":
         if secret:
             _playit_delete_tunnels(secret, local_port)
+        if local_port:
+            _TUNNEL_CREATE_GUARD.pop(int(local_port), None)  # so a later ensure re-creates it
         return {"status": "ok"}
     if op == "claim_begin":
         if secret:
@@ -597,9 +618,17 @@ def _playit(payload):
             return {"status": "connecting"}
         addr, pending = _port_address(data, local_port)
         if addr:
+            if local_port:
+                _TUNNEL_CREATE_GUARD.pop(int(local_port), None)  # rundata caught up
             return {"status": "exists", "address": addr}
         if pending:
+            if local_port:
+                _TUNNEL_CREATE_GUARD.pop(int(local_port), None)
             return {"status": "exists"}
+        if _recently_created_tunnel(local_port):
+            # We created this port's tunnel moments ago; rundata just hasn't shown it yet.
+            # Reporting `created` (NOT a 2nd /tunnels/create) is what kills the duplicate.
+            return {"status": "created"}
         agent_id = data.get("agent_id")
         if not agent_id:
             return {"status": "connecting"}
@@ -607,6 +636,7 @@ def _playit(payload):
             return {"status": "error", "error": "no local_port"}
         ok, err = _playit_create_tunnel(secret, agent_id, local_port)
         if ok:
+            _TUNNEL_CREATE_GUARD[int(local_port)] = time.monotonic()
             return {"status": "created"}
         if err == "AgentVersionTooOld":
             return {"status": "connecting"}

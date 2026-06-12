@@ -89,9 +89,11 @@ class ExecuteDispatchTests(unittest.TestCase):
 class PlayitTests(unittest.TestCase):
     def setUp(self):
         self._orig = (agent._playit_secret, agent._playit_api, agent._playit_run)
+        agent._TUNNEL_CREATE_GUARD.clear()  # in-memory create-dedup guard
 
     def tearDown(self):
         agent._playit_secret, agent._playit_api, agent._playit_run = self._orig
+        agent._TUNNEL_CREATE_GUARD.clear()
 
     def test_claim_begin_returns_claim_url(self):
         agent._playit_secret = lambda: None
@@ -182,6 +184,46 @@ class PlayitTests(unittest.TestCase):
         res = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
         self.assertEqual(res["status"], "created")
         self.assertIn("/tunnels/create", calls)
+
+    def test_ensure_tunnel_guards_duplicate_while_rundata_lags(self):
+        # After a create, rundata lags (tunnel not visible yet). A second ensure_tunnel — a
+        # saga relaunch or a 2nd bot replica — must NOT create a duplicate; it returns `created`.
+        agent._playit_secret = lambda: "sek"
+        creates = []
+
+        def fake_api(path, body, secret=None):
+            if path == "/v1/agents/rundata":
+                return True, {"agent_id": "aid", "tunnels": [], "pending": []}  # never shows it
+            if path == "/tunnels/create":
+                creates.append(body)
+                return True, {"id": "tid"}
+            return False, None
+
+        agent._playit_api = fake_api
+        r1 = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
+        r2 = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
+        self.assertEqual(r1["status"], "created")
+        self.assertEqual(r2["status"], "created")
+        self.assertEqual(len(creates), 1)  # exactly one /tunnels/create despite two calls
+
+    def test_remove_tunnel_clears_create_guard(self):
+        # Deleting a tunnel clears the guard so a later ensure re-creates it (not a no-op).
+        agent._playit_secret = lambda: "sek"
+        creates = []
+
+        def fake_api(path, body, secret=None):
+            if path == "/v1/agents/rundata":
+                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
+            if path == "/tunnels/create":
+                creates.append(body)
+                return True, {"id": "tid"}
+            return True, {}  # delete ok
+
+        agent._playit_api = fake_api
+        agent._playit({"op": "ensure_tunnel", "local_port": 25570})   # create #1, guard set
+        agent._playit({"op": "remove_tunnel", "local_port": 25570})   # clears guard
+        agent._playit({"op": "ensure_tunnel", "local_port": 25570})   # must create again
+        self.assertEqual(len(creates), 2)
 
     def test_ensure_tunnel_idempotent_when_present(self):
         # If this port already has a tunnel, ensure must NOT create another (no duplicates).
