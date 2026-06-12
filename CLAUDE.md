@@ -39,9 +39,10 @@ lives in **mc-spawn-bot** (`gitlab.com/quickserverhub/applications/mc-hosting-bo
   (`irm … | iex`); installs **Python 3** per-user via **winget** to run the agent — resolving an
   **absolute real `python.exe`** (skips the MS-Store stub + unrefreshed PATH, both silent-failure
   bugs) baked into a user-ACL'd `run.cmd` launcher. Registers autostart **as the current user,
-  never SYSTEM**: a **Scheduled Task** (S4U @startup if admin, else @logon), or — if the root task
-  folder is denied (locked-down standard users → "Access is denied") — an **HKCU `…\Run` key** +
-  hidden `launch.vbs`. **Hosting = a dedicated WSL2 distro** (`mc-spawn`, name overridable): if WSL
+  never SYSTEM**, via an **HKCU `…\Run` key** + hidden `launch.vbs` (deliberately NOT the Task
+  Scheduler — its root folder is denied to locked-down standard users, "Access is denied"; starts
+  at logon, no boot-before-login / restart-on-crash, but the agent self-recovers its connection;
+  uninstall still clears a Scheduled Task an old installer left). **Hosting = a dedicated WSL2 distro** (`mc-spawn`, name overridable): if WSL
   isn't enabled it prints the ONE admin step (`wsl --install` + reboot) and stops gracefully (agent
   already enrolled); else it imports a small Ubuntu rootfs (`MCSPAWN_WSL_ROOTFS_URL`, no Store) via
   `wsl --import`, installs `docker.io` inside as root, sets `/etc/wsl.conf` `[boot] command=service
@@ -206,7 +207,7 @@ direct subprocess (`_playit_net_args`/`_playit_local_ip`/`_playit_run`/`_playit_
 13. **Full self-uninstall on machine delete.** The `uninstall` `{containers}` command purges the
     listed MC containers + their `_data` volumes and tears down playit **synchronously**, then spawns
     a **detached** cleanup (systemd-run / new-session `sh`, or PowerShell on Windows) that removes the
-    service/Scheduled-Task (+ the HKCU `…\Run` fallback value on Windows) + the agent's own files a few
+    service (Windows: the HKCU `…\Run` value + any Scheduled Task an old installer left) + the agent's own files a few
     seconds later — surviving the agent's death when its service is stopped (and the agent.py file-lock
     on Windows). On Windows it also `wsl --unregister`s the `mc-spawn` distro — one shot wipes every
     container, volume, and Docker inside it. The agent reports the result then `sys.exit(0)` so the
@@ -230,7 +231,7 @@ direct subprocess (`_playit_net_args`/`_playit_local_ip`/`_playit_run`/`_playit_
 
 > **Windows live-verify note (WSL path):** the OS-aware helpers are unit-tested (by patching
 > `IS_WINDOWS`), but a real Windows box must confirm: (1) `install.ps1` registers autostart **as the
-> user** (S4U @startup / @logon, or HKCU Run-key fallback) and launches the agent; (2) the WSL setup
+> user** (HKCU Run-key @logon) and launches the agent; (2) the WSL setup
 > — `wsl --import mc-spawn` from the Ubuntu rootfs URL, `docker.io` install, `/etc/wsl.conf` boot
 > command, `docker info` OK — and that `_shell_argv`'s `wsl -d mc-spawn -- bash -lc …` runs the bot's
 > scripts inside it; (3) RCON + MC port reaching Windows `localhost` via WSL2 port forwarding;
@@ -240,7 +241,7 @@ direct subprocess (`_playit_net_args`/`_playit_local_ip`/`_playit_run`/`_playit_
 
 ## Logging / debug
 
-The agent runs **detached** (systemd / hidden Scheduled-Task / Run-key), so it appends to a log
+The agent runs **detached** (systemd / hidden HKCU Run-key on Windows), so it appends to a log
 **file** (`AGENT_LOG`, default `agent.log` beside the cred file) as well as stdout — that file is
 how you see what it did. Startup logs platform + **chosen engine** (`_runtime()`) + paths; a failing
 `_run_shell` logs `exit=<n>` + the engine's **stderr tail** (so "Cannot connect to Podman" / "image

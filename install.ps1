@@ -32,15 +32,11 @@ $AgentRaw   = if ($env:AGENT_RAW) { $env:AGENT_RAW } `
 if (-not $ControlUrl) { Die 'CONTROL_URL env is required' }
 if (-not $Token)      { Die 'TOKEN env is required' }
 
-# ---- privilege: per-user install dir; admin only changes WHERE the task runs ----
-$IsAdmin = ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-# Always install under the invoking user's profile — the task runs AS this user (not
-# SYSTEM), so it must see the same Python/PATH the user has. Using ProgramData with a
-# SYSTEM task was the old bug: winget installs Python per-user, so SYSTEM couldn't find
-# it and the agent died silently.
+# ---- per-user install dir; the agent's autostart runs AS THIS USER (never SYSTEM) ----
+# Install under the invoking user's profile — the autostart runs AS this user (not SYSTEM),
+# so it must see the same Python/PATH the user has. Using ProgramData with a SYSTEM task was
+# the old bug: winget installs Python per-user, so SYSTEM couldn't find it and the agent died
+# silently.
 $Dir   = Join-Path $env:LOCALAPPDATA 'mc-spawn-agent'
 $State = $Dir
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
@@ -163,23 +159,15 @@ function Lock-ToCurrentUser ($path) {
 }
 Lock-ToCurrentUser $Run
 
-# ---- service registration: Scheduled Task running AS THE CURRENT USER ----
+# ---- service registration: per-user startup (HKCU Run key), AS THE CURRENT USER ----
 # Never SYSTEM: the agent must see the user's Python and the user's WSL (the `mc-spawn`
-# distro is per-user). Admin lets us use S4U so it also starts at boot without anyone
-# logging in; without admin it starts at logon.
+# distro is per-user). We deliberately DON'T use the Task Scheduler — registering a task in
+# the root folder is denied for standard / locked-down users ("Access is denied"). The HKCU
+# Run key needs NO admin and NO Task Scheduler access and starts the agent at every logon. A
+# tiny .vbs launches run.cmd hidden (no console flash). Trade-off: logon-only (not pre-login
+# boot) and no restart-on-crash — but the agent self-recovers its connection, so it's fine.
 $TaskName = 'mc-spawn-agent'
-$UserId   = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$action   = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" `
-    -Argument "/c `"$Run`"" -WorkingDirectory $Dir
-$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
-# Fallback autostart for when the Task Scheduler is off-limits (many standard-user /
-# locked-down boxes deny registering a task in the root folder — that's the "Access is
-# denied" some users hit). The HKCU Run key needs NO admin and NO Task Scheduler access;
-# it starts the agent at every logon. A tiny .vbs launches run.cmd hidden (no console
-# flash). Trade-off vs the task: logon-only (not pre-login boot) and no restart-on-crash,
-# but the agent already self-recovers its connection, so this is a fine degradation.
 function Install-RunKeyAutostart {
     # .vbs launches run.cmd hidden (window mode 0) — no console flash at logon. In a
     # double-quoted here-string `"` is literal, so `""` is VBS's escaped quote.
@@ -194,38 +182,14 @@ CreateObject("WScript.Shell").Run "cmd /c ""$Run""", 0, False
     Log 'installed via per-user startup (Run key) — starts at logon. The bot will see it shortly.'
 }
 
-# Best-effort: clear any task a previous run left (old versions registered one under
-# SYSTEM). If we can't, no problem — we just won't reuse the task path.
+# Best-effort: clear any Scheduled Task an OLD version registered (we no longer create one;
+# a leftover task would double-launch the agent). Harmless if there's none or we can't.
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false } catch { }
 }
 
-$registered = $false
-try {
-    if ($IsAdmin) {
-        # S4U: runs as the current user at startup, no stored password, has internet
-        # access (outbound HTTPS only). Starts whether or not the user is logged in.
-        $triggers  = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -AtLogOn))
-        $principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType S4U -RunLevel Highest
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
-            -Principal $principal -Settings $settings | Out-Null
-    } else {
-        # No explicit principal: defaults to the creating user, runs only while logged on.
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-            -Settings $settings | Out-Null
-    }
-    Start-ScheduledTask -TaskName $TaskName
-    $registered = $true
-    Log "installed as a Scheduled Task (runs as $UserId) — the bot will see it shortly."
-} catch {
-    # Most common: standard user denied the root task folder. Degrade, don't die.
-    Warn "Task Scheduler unavailable ($($_.Exception.Message)) — falling back to per-user startup."
-}
-if (-not $registered) {
-    try { Install-RunKeyAutostart }
-    catch { Die "could not set up autostart (Task Scheduler and Run key both failed): $_" }
-}
+try { Install-RunKeyAutostart }
+catch { Die "could not set up per-user autostart (Run key): $_" }
 
 # ---- hosting backend: a dedicated WSL2 Linux distro with Docker inside --------------
 # THE single Windows hosting path: servers run "as on Ubuntu" inside an isolated `mc-spawn`

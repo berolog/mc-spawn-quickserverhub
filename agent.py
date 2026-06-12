@@ -664,9 +664,9 @@ def _spawn_self_cleanup():
     unit) so stopping our own service doesn't kill it mid-cleanup."""
     d, state_dir = _agent_paths()
     if IS_WINDOWS:
-        # Remove BOTH autostart forms the installer may have used: the Scheduled Task and
-        # the HKCU Run-key fallback. schtasks delete is synchronous-safe; the file delete
-        # waits out the lock on the running agent.py, then removes the dir tree.
+        # Remove BOTH autostart forms: the HKCU Run-key (current installer) and a Scheduled
+        # Task an OLD installer may have left. schtasks delete is synchronous-safe; the file
+        # delete waits out the lock on the running agent.py, then removes the dir tree.
         # Also unregister the dedicated WSL distro — one shot removes every container,
         # volume, and Docker inside it (the whole Linux hosting env), leaving the box clean.
         ps = (
