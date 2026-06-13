@@ -160,6 +160,7 @@ setup_docker() {
   fi
 }
 setup_docker
+DOCKER_BIN="$(runtime_path)" || die "container_engine_missing"
 
 # ---- install location (system when root, per-user otherwise) ----
 if [ "$ROOT" = 1 ]; then
@@ -226,6 +227,7 @@ export TOKEN="$TOKEN"
 export AGENT_STATE="$STATE/cred.json"
 export MCSPAWN_DEBUG="${MCSPAWN_DEBUG:-}"
 export PATH="$DEFAULT_PATH"
+export DOCKER_BIN="$DOCKER_BIN"
 # Self-heal (Phase 6.5): if the user deleted agent.py by hand, re-fetch it before
 # launch so the service recovers on its next restart instead of crash-looping.
 if [ ! -f "$DIR/agent.py" ]; then
@@ -251,6 +253,7 @@ Wants=network-online.target
 
 [Service]
 Environment=PATH=$DEFAULT_PATH
+Environment=DOCKER_BIN=$DOCKER_BIN
 ExecStart=$RUN
 Restart=always
 RestartSec=5
@@ -276,6 +279,7 @@ Wants=network-online.target docker.service
 User=$INSTALL_USER
 SupplementaryGroups=docker
 Environment=PATH=$DEFAULT_PATH
+Environment=DOCKER_BIN=$DOCKER_BIN
 ExecStart=$RUN
 Restart=always
 RestartSec=5
@@ -303,6 +307,7 @@ Wants=network-online.target
 
 [Service]
 Environment=PATH=$DEFAULT_PATH
+Environment=DOCKER_BIN=$DOCKER_BIN
 ExecStart=$RUN
 Restart=always
 RestartSec=5

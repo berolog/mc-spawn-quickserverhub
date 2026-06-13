@@ -273,6 +273,23 @@ class RunAllowedTests(unittest.TestCase):
              mock.patch.object(agent.os, "access", return_value=True):
             self.assertEqual(agent._find_executable("docker"), "/snap/bin/docker")
 
+    def test_engine_lookup_prefers_installer_docker_bin(self):
+        def isfile(path):
+            return path == "/custom/bin/docker"
+
+        with mock.patch.dict(agent.os.environ, {"DOCKER_BIN": "/custom/bin/docker"}), \
+             mock.patch.object(agent.os.path, "isfile", side_effect=isfile), \
+             mock.patch.object(agent.os, "access", return_value=True):
+            self.assertEqual(agent._find_executable("docker"), "/custom/bin/docker")
+
+    def test_engine_lookup_error_lists_checked_paths(self):
+        with mock.patch.dict(agent.os.environ, {"PATH": "/service/path", "DOCKER_BIN": "/custom/docker"}):
+            msg = agent._engine_lookup_error("docker")
+        self.assertIn("container_engine_unavailable:docker", msg)
+        self.assertIn("path=/service/path", msg)
+        self.assertIn("/custom/docker:", msg)
+        self.assertIn("/usr/bin/docker:", msg)
+
 
 class LogFormatTests(unittest.TestCase):
     def test_key_value_log_line_omits_empty_fields(self):

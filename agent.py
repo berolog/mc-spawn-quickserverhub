@@ -280,6 +280,10 @@ _RUNTIMES = ("docker",)
 
 
 def _find_executable(name):
+    if name == "docker":
+        override = os.environ.get("DOCKER_BIN", "").strip()
+        if override and os.path.isfile(override) and os.access(override, os.X_OK):
+            return override
     found = shutil.which(name)
     if found:
         return found
@@ -288,6 +292,22 @@ def _find_executable(name):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return None
+
+
+def _engine_lookup_error(name):
+    checked = []
+    override = os.environ.get("DOCKER_BIN", "").strip() if name == "docker" else ""
+    if override:
+        checked.append(override)
+    checked.extend(os.path.join(d, name) for d in DEFAULT_PATH.split(":"))
+    states = []
+    for path in checked:
+        try:
+            state = "x" if os.path.isfile(path) and os.access(path, os.X_OK) else "missing"
+        except OSError:
+            state = "error"
+        states.append(f"{path}:{state}")
+    return f"container_engine_unavailable:{name};path={os.environ.get('PATH', '')};checked={','.join(states)}"
 
 
 def minimal_env(rt):
@@ -346,7 +366,7 @@ def run_allowed(rt, args, timeout=ENGINE_TIMEOUT):
     else:
         exe = _find_executable(rt)
         if not exe:
-            raise CapabilityError(f"container_engine_unavailable:{rt}")
+            raise CapabilityError(_engine_lookup_error(rt))
         argv = [exe, *args]
     try:
         return subprocess.run(
@@ -356,7 +376,7 @@ def run_allowed(rt, args, timeout=ENGINE_TIMEOUT):
     except subprocess.TimeoutExpired:
         raise CapabilityError("engine command timed out")
     except FileNotFoundError:
-        raise CapabilityError(f"container_engine_unavailable:{rt}")
+        raise CapabilityError(_engine_lookup_error(rt))
 
 
 def _bounded(text, limit=4000):
