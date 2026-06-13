@@ -38,6 +38,8 @@ else
   ROOT=0; SUDO=""
 fi
 can_escalate() { [ "$ROOT" = 1 ] || [ -n "$SUDO" ]; }
+INSTALL_USER="$(id -un)"
+DOCKER_NEEDS_SYSTEMD_GROUP=0
 
 # ---- package manager abstraction ----
 PM=""
@@ -121,8 +123,16 @@ setup_docker() {
   fi
   if [ "$ROOT" = 0 ] && command -v docker >/dev/null 2>&1; then
     if ! docker info >/dev/null 2>&1 && [ -n "$SUDO" ]; then
-      $SUDO usermod -aG docker "$(id -un)" 2>/dev/null \
-        && warn "added $(id -un) to the docker group — log out/in (or run 'newgrp docker') for it to take effect"
+      if $SUDO docker info >/dev/null 2>&1; then
+        if $SUDO usermod -aG docker "$INSTALL_USER" 2>/dev/null; then
+          if command -v systemctl >/dev/null 2>&1 && getent group docker >/dev/null 2>&1; then
+            DOCKER_NEEDS_SYSTEMD_GROUP=1
+            log "added $INSTALL_USER to docker group; systemd will grant it to the agent immediately"
+          else
+            warn "added $INSTALL_USER to the docker group — log out/in (or run 'newgrp docker') for it to take effect"
+          fi
+        fi
+      fi
     fi
   fi
 }
@@ -228,6 +238,32 @@ EOF
   log "installed as a systemd system service (systemctl status mc-spawn-agent)"
 }
 
+install_systemd_system_user() {
+  unit="${TMPDIR:-/tmp}/mc-spawn-agent.service.$$"
+  cat > "$unit" <<EOF
+[Unit]
+Description=mc-spawn agent
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+User=$INSTALL_USER
+SupplementaryGroups=docker
+ExecStart=$RUN
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl --user disable --now mc-spawn-agent.service >/dev/null 2>&1 || true
+  $SUDO mv "$unit" /etc/systemd/system/mc-spawn-agent.service
+  $SUDO chmod 0644 /etc/systemd/system/mc-spawn-agent.service
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable --now mc-spawn-agent.service
+  log "installed as a systemd system service for $INSTALL_USER with docker socket access"
+}
+
 install_systemd_user() {
   unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
   mkdir -p "$unit_dir"
@@ -305,6 +341,8 @@ if [ "$ROOT" = 1 ] && command -v systemctl >/dev/null 2>&1; then
   install_systemd_system
 elif [ "$ROOT" = 1 ] && command -v rc-update >/dev/null 2>&1; then
   install_openrc
+elif [ "$DOCKER_NEEDS_SYSTEMD_GROUP" = 1 ] && [ -n "$SUDO" ]; then
+  install_systemd_system_user
 elif systemd_user_ok; then
   install_systemd_user
 else

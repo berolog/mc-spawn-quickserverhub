@@ -37,7 +37,10 @@ within local policy — never arbitrary OS commands or files.*
 - `install.sh` / `install.ps1` — portable installers. Set up the container engine **once** (the
   agent never installs packages at runtime), write a conservative default `policy.json` (owner-
   editable), register a per-user/rootless-preferring autostart, and print created files + the
-  network endpoints contacted. Pin `AGENT_RAW` to a release tag for reproducibility.
+  network endpoints contacted. Linux installer handles the fresh-Docker group-membership gap:
+  if the invoking user cannot reach `/var/run/docker.sock` until a new login session, it installs
+  a systemd system unit that still runs as that user but with `SupplementaryGroups=docker`, so no
+  server reboot is needed. Pin `AGENT_RAW` to a release tag for reproducibility.
 - `mc-spawn-agent.service` — reference systemd unit (installers generate the real one).
 - `tests/test_agent.py` — security tests: rejection matrix (shell/unknown-field/traversal/ram/
   raw-rcon/update-url all denied/invalid), policy gating, replay/expiry, path jail, capability
