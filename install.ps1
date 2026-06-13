@@ -41,6 +41,45 @@ $Dir   = Join-Path $env:LOCALAPPDATA 'mc-spawn-agent'
 $State = $Dir
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
+# Local policy (owner-controlled; the backend can NEVER change it). The agent reads this file
+# and enforces it locally — raw console + backup-restore are OFF until the owner opts in. Never
+# overwrite an existing policy (the owner may have edited it).
+$Policy = Join-Path $State 'policy.json'
+if (-not (Test-Path $Policy)) {
+  @'
+{
+  "policy_version": 1,
+  "workspace_root": "~/.mc-spawn",
+  "allowed_actions": [
+    "agent.health", "agent.capabilities", "agent.uninstall",
+    "minecraft.server.create", "minecraft.server.start", "minecraft.server.stop",
+    "minecraft.server.restart", "minecraft.server.status", "minecraft.server.logs",
+    "minecraft.server.delete", "minecraft.server.reconcile_status",
+    "minecraft.server.say", "minecraft.server.save_all",
+    "minecraft.server.console_tail", "minecraft.server.console_exec",
+    "minecraft.config.set_difficulty", "minecraft.config.set_gamemode",
+    "minecraft.player.list", "minecraft.player.whitelist_add",
+    "minecraft.player.whitelist_remove", "minecraft.player.whitelist_list",
+    "minecraft.player.kick",
+    "minecraft.backup.create", "minecraft.backup.list",
+    "minecraft.backup.delete", "minecraft.backup.restore",
+    "playit.claim_begin", "playit.claim_poll", "playit.playit_start",
+    "playit.ensure_tunnel", "playit.status", "playit.remove_tunnel", "playit.teardown"
+  ],
+  "max_ram_mb": 8192,
+  "allowed_port_range": [25565, 25700],
+  "allow_server_delete": true,
+  "allow_agent_uninstall": true,
+  "allow_raw_rcon": false,
+  "allow_backup_restore": false,
+  "allow_plugins": false,
+  "allow_mods": false,
+  "allow_agent_auto_update": false
+}
+'@ | Set-Content -Path $Policy -Encoding UTF8
+  Write-Host "[mc-spawn-agent] wrote default policy: $Policy (edit it to tighten what the bot may do)"
+}
+
 function Have ($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 
 function Refresh-Path {

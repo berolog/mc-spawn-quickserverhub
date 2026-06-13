@@ -138,6 +138,47 @@ else
 fi
 mkdir -p "$DIR" "$STATE"
 
+# ---- local policy (owner-controlled; the backend can NEVER change it) ----
+# Write a conservative default the machine owner can edit. The agent reads this file
+# ($STATE/policy.json by default) and enforces it locally; the raw console and backup-restore
+# are OFF until the owner opts in. Never overwrite an existing policy (the owner may have edited it).
+POLICY="$STATE/policy.json"
+if [ ! -f "$POLICY" ]; then
+  cat > "$POLICY" <<'EOF'
+{
+  "policy_version": 1,
+  "workspace_root": "~/.mc-spawn",
+  "allowed_actions": [
+    "agent.health", "agent.capabilities", "agent.uninstall",
+    "minecraft.server.create", "minecraft.server.start", "minecraft.server.stop",
+    "minecraft.server.restart", "minecraft.server.status", "minecraft.server.logs",
+    "minecraft.server.delete", "minecraft.server.reconcile_status",
+    "minecraft.server.say", "minecraft.server.save_all",
+    "minecraft.server.console_tail", "minecraft.server.console_exec",
+    "minecraft.config.set_difficulty", "minecraft.config.set_gamemode",
+    "minecraft.player.list", "minecraft.player.whitelist_add",
+    "minecraft.player.whitelist_remove", "minecraft.player.whitelist_list",
+    "minecraft.player.kick",
+    "minecraft.backup.create", "minecraft.backup.list",
+    "minecraft.backup.delete", "minecraft.backup.restore",
+    "playit.claim_begin", "playit.claim_poll", "playit.playit_start",
+    "playit.ensure_tunnel", "playit.status", "playit.remove_tunnel", "playit.teardown"
+  ],
+  "max_ram_mb": 8192,
+  "allowed_port_range": [25565, 25700],
+  "allow_server_delete": true,
+  "allow_agent_uninstall": true,
+  "allow_raw_rcon": false,
+  "allow_backup_restore": false,
+  "allow_plugins": false,
+  "allow_mods": false,
+  "allow_agent_auto_update": false
+}
+EOF
+  chmod 0644 "$POLICY"
+  log "wrote default policy: $POLICY (edit it to tighten what the bot may do)"
+fi
+
 log "fetching agent.py"
 fetch "$AGENT_RAW/agent.py" "$DIR/agent.py"
 chmod 0644 "$DIR/agent.py"
@@ -271,5 +312,13 @@ else
 fi
 
 log "mc-spawn agent installed and started. Управление — в Telegram-боте."
-log "agent log: $STATE/agent.log   (tail -f $STATE/agent.log)"
-log "verbose:   re-run the installer with  MCSPAWN_DEBUG=1  prepended"
+# Transparency (spec §14): show exactly what was created + what the agent talks to, so the
+# owner can audit and remove it. No inbound ports are opened on this box.
+log "files created:    $DIR/ (agent.py, run.sh)   $STATE/ (cred.json, policy.json, agent.log)"
+log "local policy:     $POLICY   (owner-editable; backend cannot change it)"
+log "workspace:        ~/.mc-spawn/   (servers/worlds, backups, logs, tmp — all jailed here)"
+log "network out only: $CONTROL_URL   and   https://api.playit.gg   (if you link playit)"
+log "audit log:        ~/.mc-spawn/logs/audit.log   (every allow/deny decision)"
+log "agent log:        $STATE/agent.log   (tail -f $STATE/agent.log)"
+log "inspect/control:  python3 $DIR/agent.py policy|capabilities|audit|wipe-creds"
+log "verbose:          re-run the installer with  MCSPAWN_DEBUG=1  prepended"
