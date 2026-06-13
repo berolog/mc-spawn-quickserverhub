@@ -270,7 +270,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now mc-spawn-agent.service
+  systemctl enable mc-spawn-agent.service
+  systemctl restart mc-spawn-agent.service
   log "service_installed" "manager=systemd scope=system"
 }
 
@@ -297,7 +298,8 @@ EOF
   $SUDO mv "$unit" /etc/systemd/system/mc-spawn-agent.service
   $SUDO chmod 0644 /etc/systemd/system/mc-spawn-agent.service
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now mc-spawn-agent.service
+  $SUDO systemctl enable mc-spawn-agent.service
+  $SUDO systemctl restart mc-spawn-agent.service
   log "service_installed" "manager=systemd scope=system user=$INSTALL_USER docker_group=true"
 }
 
@@ -320,7 +322,8 @@ RestartSec=5
 WantedBy=default.target
 EOF
   systemctl --user daemon-reload
-  systemctl --user enable --now mc-spawn-agent.service
+  systemctl --user enable mc-spawn-agent.service
+  systemctl --user restart mc-spawn-agent.service
   # Without lingering a user service dies on logout; needs root to enable.
   if [ -n "$SUDO" ]; then
     $SUDO loginctl enable-linger "$(id -un)" >/dev/null 2>&1 \
