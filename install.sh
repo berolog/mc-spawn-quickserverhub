@@ -21,7 +21,7 @@ CONTROL_URL="${CONTROL_URL:-}"
 TOKEN="${TOKEN:-}"
 # Where to fetch agent.py from (override for forks / pinned commits).
 AGENT_RAW="${AGENT_RAW:-https://raw.githubusercontent.com/berolog/mc-spawn-quickserverhub/main}"
-DEFAULT_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+DEFAULT_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 export PATH="${PATH:-$DEFAULT_PATH}"
 
 log()  { printf 'level=info event=%s%s\n' "$1" "${2:+ $2}"; }
@@ -101,19 +101,51 @@ ensure_cmd bash bash
 # all work (the agent auto-detects via $MCSPAWN_RT): if ANY is present we install
 # nothing; otherwise install docker (the most universal default). Best-effort: prefer
 # the distro package; fall back to get.docker.com only if that fails and we can root.
+runtime_path() {
+  for rt in docker podman nerdctl; do
+    p="$(command -v "$rt" 2>/dev/null || true)"
+    if [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
+    old_ifs=$IFS; IFS=:
+    for d in $DEFAULT_PATH; do
+      if [ -x "$d/$rt" ]; then IFS=$old_ifs; printf '%s\n' "$d/$rt"; return 0; fi
+    done
+    IFS=$old_ifs
+  done
+  return 1
+}
+
+install_docker_upstream() {
+  can_escalate || return 1
+  tmp="${TMPDIR:-/tmp}/mc-spawn-get-docker.sh"
+  fetch "https://get.docker.com" "$tmp" || return 1
+  $SUDO sh "$tmp"
+}
+
 setup_docker() {
-  if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1 \
-     || command -v nerdctl >/dev/null 2>&1; then
-    log "container_engine_present"
+  if engine="$(runtime_path)"; then
+    log "container_engine_present" "path=$engine"
   elif [ -n "$PM" ] && can_escalate; then
     if ! pm_install "$(pkgname docker)"; then
       warn "docker_package_failed"
-      $SUDO sh -c 'curl -fsSL https://get.docker.com | sh' || warn "docker_install_failed"
+      install_docker_upstream || warn "docker_install_failed"
     fi
   elif can_escalate; then
-    $SUDO sh -c 'curl -fsSL https://get.docker.com | sh' || warn "docker_install_failed"
+    install_docker_upstream || warn "docker_install_failed"
   else
-    warn "docker_missing"
+    die "container_engine_missing"
+  fi
+  if ! engine="$(runtime_path)"; then
+    if can_escalate; then
+      install_docker_upstream || true
+    fi
+  fi
+  engine="$(runtime_path)" || die "container_engine_missing"
+  log "container_engine_ready" "path=$engine"
+  case "$engine" in
+    */docker) : ;;
+    *) return 0 ;;
+  esac
+  if [ "$(basename "$engine")" != "docker" ]; then
     return 0
   fi
   # Start the daemon and make the invoking user able to reach it without root.

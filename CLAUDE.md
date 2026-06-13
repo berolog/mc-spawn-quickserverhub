@@ -40,9 +40,10 @@ within local policy — never arbitrary OS commands or files.*
   network endpoints contacted. Linux installer handles the fresh-Docker group-membership gap:
   if the invoking user cannot reach `/var/run/docker.sock` until a new login session, it installs
   a systemd system unit that still runs as that user but with `SupplementaryGroups=docker`, so no
-  server reboot is needed. Installer-generated launchers/units set a known system `PATH` so the
-  agent can find Docker from systemd's sparse environment. Pin `AGENT_RAW` to a release tag for
-  reproducibility.
+  server reboot is needed. Installer-generated launchers/units set a known system `PATH`
+  (including `/snap/bin`) so the agent can find Docker from systemd's sparse environment; the
+  installer verifies a runtime exists after install and stops with `container_engine_missing`
+  instead of enrolling a broken agent. Pin `AGENT_RAW` to a release tag for reproducibility.
 - `mc-spawn-agent.service` — reference systemd unit (installers generate the real one).
 - `tests/test_agent.py` — security tests: rejection matrix (shell/unknown-field/traversal/ram/
   raw-rcon/update-url all denied/invalid), policy gating, replay/expiry, path jail, capability

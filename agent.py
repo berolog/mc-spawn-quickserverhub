@@ -79,7 +79,7 @@ DEBUG = os.environ.get("MCSPAWN_DEBUG", "").strip().lower() not in ("", "0", "fa
 LOG_PATH = os.environ.get("AGENT_LOG") or os.path.join(
     os.path.dirname(STATE_PATH) or ".", "agent.log")
 _LOG_CAP = 1_000_000
-DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 
 
 def _quote_log_value(value):

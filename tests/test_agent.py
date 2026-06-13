@@ -264,6 +264,15 @@ class RunAllowedTests(unittest.TestCase):
              mock.patch.object(agent.os, "access", return_value=True):
             self.assertEqual(agent._find_executable("docker"), "/usr/bin/docker")
 
+    def test_engine_lookup_checks_snap_path(self):
+        def isfile(path):
+            return path == "/snap/bin/docker"
+
+        with mock.patch.object(agent.shutil, "which", return_value=None), \
+             mock.patch.object(agent.os.path, "isfile", side_effect=isfile), \
+             mock.patch.object(agent.os, "access", return_value=True):
+            self.assertEqual(agent._find_executable("docker"), "/snap/bin/docker")
+
 
 class LogFormatTests(unittest.TestCase):
     def test_key_value_log_line_omits_empty_fields(self):
