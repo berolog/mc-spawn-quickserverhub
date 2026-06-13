@@ -118,7 +118,6 @@ CONTROL_URL=http://127.0.0.1:8080 TOKEN=<token> AGENT_STATE=/tmp/cred.json pytho
 | `AGENT_RAW` | no | this repo's GitHub raw | Base URL `agent.py` is fetched from (forks / pinned commits). |
 | `AGENT_LOG` | no | `agent.log` next to the cred file | Where the agent appends its log (it runs detached, so this file is how you see what it did). |
 | `MCSPAWN_DEBUG` | no | off | `1` ⇒ verbose logs (engine detection, per-command output). Secrets/script text are never logged. |
-| `CONTAINER_RUNTIME` | no | Linux: auto (`docker`→`podman`→`nerdctl`); Windows: `docker` (in WSL) | Force a specific container engine. |
 | `MCSPAWN_WSL_DISTRO` | no | `mc-spawn` | (Windows) name of the dedicated WSL distro hosting runs in. |
 | `MCSPAWN_WSL_ROOTFS_URL` | no | Ubuntu WSL rootfs | (Windows) rootfs the installer imports for that distro. |
 | `AGENT_SHELL` | no | `bash` (Linux) / `wsl -d <distro>` (Windows) | Override the shell scripts run in (e.g. a non-WSL Windows setup). |
@@ -155,9 +154,8 @@ journalctl -u mc-spawn-agent -f                  # systemd backends also log to 
 Get-Content "$env:LOCALAPPDATA\mc-spawn-agent\agent.log" -Wait
 ```
 
-The startup line shows the platform, the **chosen container engine**, and all paths.
-Failed shell commands log their exit code + the engine's stderr (e.g. *"Cannot connect to
-Podman"*), so engine/connection problems are obvious. For verbose output (engine
+The startup line shows the platform, Docker runtime, and all paths.
+Failed Docker commands log their exit code + stderr, so engine/connection problems are obvious. For verbose output (engine
 detection, per-command stdout) set `MCSPAWN_DEBUG=1` — re-run the installer with it
 prepended, e.g. `MCSPAWN_DEBUG=1 CONTROL_URL=… TOKEN=… sh` (Linux) or
 `$env:MCSPAWN_DEBUG=1` before the PowerShell one-liner. The agent never logs secrets or
@@ -173,8 +171,8 @@ Pure, no network: shell executor, command dispatch, RCON soft-error path.
 
 ## Reliability & idempotency
 
-- **Any container engine.** Auto-detects `docker → podman → nerdctl` (override with
-  `CONTAINER_RUNTIME`); the installer installs docker only if none is present.
+- **Docker only.** The installer installs Docker when missing and verifies the `docker`
+  executable before enrolling the agent.
 - **Auto-reconnect.** The poll loop backs off and retries through network blips, control-
   plane restarts (5xx) and edge errors; a rejected secret triggers one re-enroll if a
   fresh `TOKEN` is set, else a clean exit.

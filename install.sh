@@ -97,20 +97,16 @@ ensure_cmd python3 python3
 # (Alpine has none by default).
 ensure_cmd bash bash
 
-# Container engine — needed to provision the Minecraft server. docker/podman/nerdctl
-# all work (the agent auto-detects via $MCSPAWN_RT): if ANY is present we install
-# nothing; otherwise install docker (the most universal default). Best-effort: prefer
-# the distro package; fall back to get.docker.com only if that fails and we can root.
+# Docker is needed to provision the Minecraft server. Best-effort: prefer the distro package;
+# fall back to get.docker.com only if that fails and we can root.
 runtime_path() {
-  for rt in docker podman nerdctl; do
-    p="$(command -v "$rt" 2>/dev/null || true)"
-    if [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
-    old_ifs=$IFS; IFS=:
-    for d in $DEFAULT_PATH; do
-      if [ -x "$d/$rt" ]; then IFS=$old_ifs; printf '%s\n' "$d/$rt"; return 0; fi
-    done
-    IFS=$old_ifs
+  p="$(command -v docker 2>/dev/null || true)"
+  if [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  old_ifs=$IFS; IFS=:
+  for d in $DEFAULT_PATH; do
+    if [ -x "$d/docker" ]; then IFS=$old_ifs; printf '%s\n' "$d/docker"; return 0; fi
   done
+  IFS=$old_ifs
   return 1
 }
 
@@ -141,13 +137,6 @@ setup_docker() {
   fi
   engine="$(runtime_path)" || die "container_engine_missing"
   log "container_engine_ready" "path=$engine"
-  case "$engine" in
-    */docker) : ;;
-    *) return 0 ;;
-  esac
-  if [ "$(basename "$engine")" != "docker" ]; then
-    return 0
-  fi
   # Start the daemon and make the invoking user able to reach it without root.
   if command -v systemctl >/dev/null 2>&1; then
     $SUDO systemctl enable --now docker >/dev/null 2>&1 || true

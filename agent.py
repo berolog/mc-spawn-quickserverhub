@@ -11,8 +11,8 @@ THREAT_MODEL.md / docs/PROTOCOL_V2.md.
 
 Outbound only: it dials the control API (no inbound ports on this box), redeems a one-time
 enroll token for a long-lived secret, then long-polls for v2 commands and executes the
-allowed capability locally. The container engine (docker/podman/nerdctl) is set up ONCE by
-the installer; the agent never installs packages or runs arbitrary OS commands at runtime.
+allowed capability locally. Docker is set up ONCE by the installer; the agent never installs
+packages or runs arbitrary OS commands at runtime.
 
 Config via env: CONTROL_URL (required, HTTPS — http only with MCSPAWN_DEV=1), TOKEN
 (one-time, first run only), AGENT_STATE (cred file). Local policy + workspace + audit log
@@ -268,22 +268,15 @@ _RUNTIME_CACHE = None
 
 
 def _runtime():
-    """The container engine to use. `CONTAINER_RUNTIME` overrides; cached. Windows = `docker`
-    inside the WSL distro. Linux auto-detects docker → podman → nerdctl on PATH."""
+    """The container engine to use. Docker only; cached. Windows = `docker` inside WSL."""
     global _RUNTIME_CACHE
     if _RUNTIME_CACHE is not None:
         return _RUNTIME_CACHE
-    override = os.environ.get("CONTAINER_RUNTIME", "").strip()
-    if override and override in _RUNTIMES:
-        _RUNTIME_CACHE = override
-    elif IS_WINDOWS:
-        _RUNTIME_CACHE = "docker"
-    else:
-        _RUNTIME_CACHE = next((rt for rt in _RUNTIMES if _find_executable(rt)), "docker")
+    _RUNTIME_CACHE = "docker"
     return _RUNTIME_CACHE
 
 
-_RUNTIMES = ("docker", "podman", "nerdctl")
+_RUNTIMES = ("docker",)
 
 
 def _find_executable(name):
@@ -304,7 +297,6 @@ def minimal_env(rt):
             "APPDATA", "TEMP", "TMP", "DOCKER_HOST", "XDG_RUNTIME_DIR")
     env = {k: os.environ[k] for k in keep if k in os.environ}
     env["PATH"] = env.get("PATH") or DEFAULT_PATH
-    env["MCSPAWN_RT"] = rt
     return env
 
 

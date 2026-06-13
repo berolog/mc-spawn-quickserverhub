@@ -81,8 +81,8 @@ always `done`; the bot reads `result.status`). Full action table: `docs/PROTOCOL
 3. **The agent is the security boundary; the backend is untrusted.** Every command is parsed,
    schema-validated, policy-checked, and mapped to a hardcoded capability. Deny-by-default:
    unknown action → `denied`; unknown field/bad type/out-of-range → `invalid`; never fail open.
-4. **No shell, ever.** No `_run_shell`/`_shell_argv`/`AGENT_SHELL`. Capabilities run fixed argv
-   via `run_allowed` (engine allowlist docker/podman/nerdctl, Windows via `wsl -d <distro> --`).
+4. **No shell, ever.** No `_run_shell`/`_shell_argv`/`AGENT_SHELL`. Capabilities run fixed Docker
+   argv via `run_allowed` (Windows via `wsl -d <distro> -- docker ...`).
    `test_no_shell.py` enforces this in CI. Agent-internal maintenance uses `_run_internal` (argv).
 5. **Resource names are agent-derived.** Container = `mcspawn-server-<validated server_id>`,
    volume = `<container>_data`, playit container = `mc-spawn-playit`, tunnels = `mc-spawn-<port>`.

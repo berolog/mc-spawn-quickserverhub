@@ -45,9 +45,9 @@ Prefer a **release tag** over `main` (`AGENT_RAW=.../<TAG>`), and verify the pub
 
 ## Reducing Docker risk
 
-Provisioning needs a container engine. To minimize blast radius:
+Provisioning needs Docker. To minimize blast radius:
 
-- Prefer **rootless Docker** or **Podman** (the agent auto-detects `docker → podman → nerdctl`).
+- Prefer **rootless Docker** where practical.
 - Prefer a **dedicated OS user** (e.g. `mcspawn`) rather than adding your primary account to the
   `docker` group (docker-group membership is root-equivalent). On Windows, hosting is confined to
   a dedicated WSL2 distro.

@@ -11,7 +11,7 @@ the boundaries are, and what is explicitly out of scope.
 - The **user can be socially engineered** into pressing buttons in the bot.
 - The **local machine and OS are trusted** up to the point of agent installation (we cannot
   defend a box that is already compromised).
-- The **container engine (Docker/Podman) is trusted** to provide normal container isolation.
+- **Docker is trusted** to provide normal container isolation.
 
 ## Threats and mitigations
 
@@ -35,7 +35,7 @@ the boundaries are, and what is explicitly out of scope.
 1. **Local agent validation** — envelope parse, schema, deny-by-default registry.
 2. **Local policy** — owner-controlled allowlist, limits, dangerous-action flags.
 3. **Workspace jail** — all mutable state under one root; no arbitrary paths.
-4. **No shell** — capabilities run fixed argv via a container-engine allowlist.
+4. **No shell** — capabilities run fixed Docker argv.
 5. **No raw RCON by default** — semantic actions only unless the owner opts in.
 6. **Itemized confirmation** for destructive actions (bot side) + resource-scoping (agent side).
 
@@ -45,6 +45,6 @@ the boundaries are, and what is explicitly out of scope.
   chooses to install.
 - **OS-level compromise that predates** agent installation.
 - **Docker daemon compromise** on a host where Docker is configured root-equivalent. (We
-  recommend rootless Docker / Podman and a dedicated OS user — see
+  recommend rootless Docker and a dedicated OS user — see
   [docs/INSTALL_SAFELY.md](docs/INSTALL_SAFELY.md).)
 - Denial of service from the user's own actions (filling their disk with worlds/backups).
