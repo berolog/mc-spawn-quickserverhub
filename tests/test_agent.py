@@ -203,6 +203,35 @@ class PathJailTests(unittest.TestCase):
             agent.safe_join("/tmp/mcsroot", "../../secret")
 
 
+class ResultDeliveryTests(unittest.TestCase):
+    def test_post_result_retries_until_accepted(self):
+        with mock.patch.object(agent, "_http", side_effect=[(503, None), (200, {"ok": True})]) as http, \
+             mock.patch.object(agent.time, "sleep") as sleep:
+            status = agent._post_result("secret", 42, {"status": "ok"})
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(http.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_post_result_retries_after_transport_error(self):
+        with mock.patch.object(agent, "_http", side_effect=[OSError("network"), (200, {})]) as http, \
+             mock.patch.object(agent.time, "sleep") as sleep:
+            status = agent._post_result("secret", 42, {"status": "ok"})
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(http.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_post_result_returns_unauthorized(self):
+        with mock.patch.object(agent, "_http", return_value=(401, None)) as http, \
+             mock.patch.object(agent.time, "sleep") as sleep:
+            status = agent._post_result("secret", 42, {"status": "ok"})
+
+        self.assertEqual(status, "unauthorized")
+        http.assert_called_once()
+        sleep.assert_not_called()
+
+
 class CapabilityArgvTests(SecurityBase):
     """The hardcoded capabilities must build a SAFE fixed argv — RCON on loopback, container
     name derived from server_id, semantic RCON via `docker exec rcon-cli` (no password)."""

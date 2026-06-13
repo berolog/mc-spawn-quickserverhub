@@ -70,6 +70,7 @@ STATE_PATH = os.environ.get("AGENT_STATE", _default_state_path())
 POLL_TIMEOUT = 40        # > server long-poll (25s)
 ENGINE_TIMEOUT = 600     # container ops (image pull on first create) can be slow
 USER_AGENT = f"mc-spawn-agent/{AGENT_VERSION}"
+RESULT_POST_RETRY_MAX_SEC = 30
 # Accept commands at most this far out of sync with the issuer's clock (spec §17).
 CLOCK_SKEW_SEC = 120
 # Remember recently-seen request_ids this long to drop replays / return the prior result.
@@ -404,6 +405,35 @@ def _http(method, path, body=None, secret=None, timeout=POLL_TIMEOUT):
             return resp.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
         return e.code, None
+
+
+def _post_result(secret, command_id, result):
+    """Result delivery is part of command execution. If this POST is lost after a long Docker
+    run, the queue row stays `running` and the bot waits until its timeout. Retry until the
+    control plane accepts it, or until auth is rejected and the caller must re-enroll."""
+    retry = 1
+    while True:
+        try:
+            status, _data = _http(
+                "POST", "/result",
+                {"id": command_id, "status": "done", "result": result},
+                secret=secret,
+                timeout=20,
+            )
+        except (urllib.error.URLError, OSError, ConnectionError) as e:
+            status = None
+            _log("result_post_transport_error", level="warning",
+                 command_id=command_id, error=type(e).__name__, retry_sec=retry)
+        if status == 200:
+            return "ok"
+        if status == 401:
+            _log("result_post_auth_rejected", level="warning", command_id=command_id)
+            return "unauthorized"
+        if status is not None:
+            _log("result_post_http_error", level="warning",
+                 command_id=command_id, http_status=status, retry_sec=retry)
+        time.sleep(retry)
+        retry = min(retry * 2, RESULT_POST_RETRY_MAX_SEC)
 
 
 # ---- credential persistence ----
@@ -1418,9 +1448,29 @@ def main():
             status, cmd = _http("GET", "/poll", secret=secret)
             if status == 200 and cmd:
                 envelope = cmd.get("payload") if isinstance(cmd, dict) else None
+                action = envelope.get("action") if isinstance(envelope, dict) else None
+                started = time.monotonic()
+                _log("command_start", command_id=cmd.get("id"), action=action)
                 result = process_command(envelope if isinstance(envelope, dict) else {})
-                _http("POST", "/result",
-                      {"id": cmd["id"], "status": "done", "result": result}, secret=secret)
+                _log(
+                    "command_finish",
+                    command_id=cmd.get("id"),
+                    action=result.get("action"),
+                    status=result.get("status"),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                post_status = _post_result(secret, cmd["id"], result)
+                if post_status == "unauthorized":
+                    _log("auth_rejected", level="warning")
+                    new_secret = _enroll()
+                    if not new_secret:
+                        _log("reenroll_failed", level="error")
+                        sys.exit(1)
+                    secret = new_secret
+                    post_status = _post_result(secret, cmd["id"], result)
+                    if post_status != "ok":
+                        _log("result_post_failed", level="error", command_id=cmd.get("id"))
+                        sys.exit(1)
                 if result.get("action") == "agent.uninstall" and result.get("status") == "ok":
                     _log("agent_uninstalled")
                     sys.exit(0)

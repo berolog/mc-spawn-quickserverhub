@@ -23,7 +23,8 @@ within local policy — never arbitrary OS commands or files.*
 ## Files
 
 - `agent.py` — **stdlib only** (urllib/json/subprocess/re/datetime + platform/shutil). The whole
-  client. Sections: enroll/poll loop (`main`, re-enrolls once on 401); **v2 dispatch**
+  client. Sections: enroll/poll loop (`main`, re-enrolls once on 401; `_post_result` retries
+  result delivery until the control plane accepts it); **v2 dispatch**
   (`process_command`: envelope parse → expiry/replay guard → registry → policy → schema →
   capability → result envelope); **policy** (`_load_policy`, `_DEFAULT_POLICY`, deny-by-default);
   **schema** (`SCHEMAS`, `validate_params`, unknown-field reject); **path jail** (`safe_join`,
@@ -72,6 +73,8 @@ payload**, so the control plane stays a dumb pass-through (no schema change). Bu
 expires_at}`. **Result envelope** (in `result`): `{request_id, status, action, result,
 agent_policy_version}`, `status ∈ ok|denied|invalid|failed|pending_local_approval` (queue row is
 always `done`; the bot reads `result.status`). Full action table: `docs/PROTOCOL_V2.md`.
+Result delivery is retried by the agent until `/result` returns 200; a transient network/control
+plane blip after a long Docker command must not leave the queue row stuck in `running`.
 
 ## Key invariants
 
