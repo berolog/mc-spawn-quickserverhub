@@ -207,7 +207,8 @@ def _policy(key):
 
 
 def _workspace_root():
-    return os.path.abspath(_policy("workspace_root") or _DEFAULT_POLICY["workspace_root"])
+    return os.path.abspath(os.path.expanduser(
+        _policy("workspace_root") or _DEFAULT_POLICY["workspace_root"]))
 
 
 # ---- audit log (decisions only; never secrets, never scripts — scripts no longer exist) ----
@@ -375,8 +376,9 @@ def run_allowed(rt, args, timeout=ENGINE_TIMEOUT):
         )
     except subprocess.TimeoutExpired:
         raise CapabilityError("engine command timed out")
-    except FileNotFoundError:
-        raise CapabilityError(_engine_lookup_error(rt))
+    except FileNotFoundError as e:
+        missing = getattr(e, "filename", None) or str(e)
+        raise CapabilityError(f"engine_workdir_unavailable:{missing}")
 
 
 def _bounded(text, limit=4000):

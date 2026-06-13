@@ -177,6 +177,15 @@ class ReplayExpiryTests(SecurityBase):
 
 
 class PathJailTests(unittest.TestCase):
+    def test_workspace_root_expands_tilde_policy(self):
+        old = agent._POLICY_CACHE
+        try:
+            agent._POLICY_CACHE = {**agent._DEFAULT_POLICY, "workspace_root": "~/.mc-spawn"}
+            self.assertNotIn("~", agent._workspace_root())
+            self.assertTrue(agent._workspace_root().endswith(".mc-spawn"))
+        finally:
+            agent._POLICY_CACHE = old
+
     def test_parent_escape(self):
         with self.assertRaises(agent.SecurityError):
             agent.safe_join("/tmp/mcsroot", "..", "etc")
