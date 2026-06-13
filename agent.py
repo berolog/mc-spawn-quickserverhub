@@ -1,64 +1,62 @@
 #!/usr/bin/env python3
 """mc-spawn agent — runs on the user's own machine. STDLIB ONLY (python3).
 
-Outbound only: it dials the control API (no inbound ports on this box), redeems a
-one-time enroll token for a long-lived secret, then long-polls for commands and
-executes them locally:
-  * shell  — run a shell script (provisioning/lifecycle issued by the bot);
-  * rcon   — talk to a Minecraft RCON on 127.0.0.1 (no tunnel needed; we're local);
-  * playit — link the user's own playit.gg account (claim flow) and report the public
-             play address friends connect to (no inbound port opened on this box).
+SECURITY MODEL (protocol v2): the backend (Telegram bot / control plane) is treated as
+UNTRUSTED. It can only request documented Minecraft operations by name (`action` + typed
+`params`); it can NOT send code to run. This agent is the security boundary: every command
+is parsed, schema-validated, checked against a LOCAL policy file the machine owner controls,
+and only then mapped to a HARDCODED capability that runs a fixed `docker`/`wsl` argv — never
+a shell. Anything outside the public protocol or local policy is denied. See SECURITY.md /
+THREAT_MODEL.md / docs/PROTOCOL_V2.md.
 
-Config via env: CONTROL_URL (required), TOKEN (one-time, first run only),
-AGENT_STATE (cred file; default /etc/mc-spawn-agent/cred.json on Linux,
-%LOCALAPPDATA%\\mc-spawn-agent\\cred.json on Windows).
+Outbound only: it dials the control API (no inbound ports on this box), redeems a one-time
+enroll token for a long-lived secret, then long-polls for v2 commands and executes the
+allowed capability locally. The container engine (docker/podman/nerdctl) is set up ONCE by
+the installer; the agent never installs packages or runs arbitrary OS commands at runtime.
+
+Config via env: CONTROL_URL (required, HTTPS — http only with MCSPAWN_DEV=1), TOKEN
+(one-time, first run only), AGENT_STATE (cred file). Local policy + workspace + audit log
+live under the workspace root (default ~/.mc-spawn) and a policy file the owner edits:
+  Linux:   /etc/mc-spawn-agent/policy.json (root) or ~/.config/mc-spawn-agent/policy.json
+  Windows: %LOCALAPPDATA%\\mc-spawn-agent\\policy.json
 
 Cross-platform (Linux + Windows): on Linux the agent runs the engine directly; on Windows
-hosting runs inside a dedicated WSL2 Linux distro (`mc-spawn`) — `_shell_argv` routes every
-engine command through `wsl -d <distro>`, so it is "just Linux" there (Docker, host-net
-playit, 127.0.0.1). WSL2 forwards published container ports to Windows localhost, so RCON and
-the MC port work from the Windows side. The installer sets the distro up. See install.sh /
-install.ps1.
+hosting runs inside a dedicated WSL2 Linux distro (`mc-spawn`) — `run_allowed` routes every
+engine command through `wsl -d <distro> -- <exe> <argv...>` (argv array, never a shell).
 
-Thin by design: all Minecraft logic lives in the bot (mc-spawn-bot) — the agent is
-a small, auditable executor. This is the client half of the system and lives in its
-own repository so users can inspect exactly what they install; a Go rewrite can be a
-drop-in (same versioned HTTP protocol — PROTOCOL_VERSION).
+CLI:  python3 agent.py [audit|policy|capabilities|wipe-creds|approve <id>]
+Single file, stdlib only — a Go rewrite stays a drop-in behind the same versioned protocol.
 """
+import datetime
 import json
 import os
 import platform
-import shlex
+import re
 import shutil
-import socket
-import struct
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
-# Phase 6: the agent is cross-platform (Linux + Windows). os.name == "nt" on Windows.
 IS_WINDOWS = os.name == "nt"
 
-# Windows hosting runs entirely inside a dedicated WSL2 Linux distro (so it is "just
-# Linux" — Docker, host-net playit, 127.0.0.1). The agent stays a Windows process but
-# shells every engine command into this distro via `wsl -d <distro>`. The installer
-# imports it (no Store, no admin); override the name with MCSPAWN_WSL_DISTRO.
+# Windows hosting runs inside a dedicated WSL2 Linux distro; the agent shells engine commands
+# into it via `wsl -d <distro> -- <exe> ...` (argv array). Override with MCSPAWN_WSL_DISTRO.
 WSL_DISTRO = os.environ.get("MCSPAWN_WSL_DISTRO", "mc-spawn").strip() or "mc-spawn"
 
-# Versioned control-plane contract (Phase 6): the agent advertises this on every
-# call so a future compiled (Go) binary can be a drop-in and the control plane can
-# negotiate. Bump ONLY on a breaking change to the /enroll·/poll·/result wire shapes.
-PROTOCOL_VERSION = 1
-# Coarse platform tag the control plane stores (e.g. "linux/x86_64", "windows/amd64").
+# Versioned control-plane contract. v2 = the capability-based, deny-by-default protocol
+# (action + params envelope). Bump ONLY on a breaking wire change; update both repos together.
+PROTOCOL_VERSION = 2
+AGENT_VERSION = "2.0.0"
 PLATFORM = f"{platform.system().lower()}/{(platform.machine() or '').lower()}"
+
+# Local-dev escape hatch: allow a non-HTTPS CONTROL_URL only when explicitly set. NEVER in a
+# release/installer-driven run — production talks HTTPS to the control plane only (spec §17).
+DEV_MODE = os.environ.get("MCSPAWN_DEV", "").strip().lower() not in ("", "0", "false", "no")
 
 
 def _default_state_path():
-    """Cred-file default. The installer always sets AGENT_STATE explicitly; this only
-    covers a bare manual run. Windows has no /etc; the installer runs the agent as the
-    user (not SYSTEM), so prefer per-user LOCALAPPDATA (writable without admin)."""
     if IS_WINDOWS:
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("ProgramData") or os.getcwd()
         return os.path.join(base, "mc-spawn-agent", "cred.json")
@@ -70,32 +68,28 @@ TOKEN = os.environ.get("TOKEN", "").strip()
 STATE_PATH = os.environ.get("AGENT_STATE", _default_state_path())
 
 POLL_TIMEOUT = 40        # > server long-poll (25s)
-SHELL_TIMEOUT = 600      # provisioning (docker pull) can be slow
-# urllib's default "Python-urllib/x.y" UA is on Cloudflare's Browser Integrity
-# Check banlist (HTTP 403, error 1010) — the control plane sits behind a proxied
-# Cloudflare hostname, so send a real product UA or enroll/poll never get through.
-USER_AGENT = "mc-spawn-agent/1.0"
+ENGINE_TIMEOUT = 600     # container ops (image pull on first create) can be slow
+USER_AGENT = f"mc-spawn-agent/{AGENT_VERSION}"
+# Accept commands at most this far out of sync with the issuer's clock (spec §17).
+CLOCK_SKEW_SEC = 120
+# Remember recently-seen request_ids this long to drop replays / return the prior result.
+REPLAY_WINDOW_SEC = 600
 
-# Observability. The agent normally runs detached (systemd / hidden Scheduled-Task /
-# Run-key wscript) with no visible console, so it also appends to a log FILE — that's
-# how you see what it actually did. `MCSPAWN_DEBUG=1` adds verbose lines (full command
-# output, runtime detection). Secrets (token/secret/RCON+playit passwords) and the
-# provisioning script text (which carries the RCON password) are NEVER written.
 DEBUG = os.environ.get("MCSPAWN_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
 LOG_PATH = os.environ.get("AGENT_LOG") or os.path.join(
     os.path.dirname(STATE_PATH) or ".", "agent.log")
-_LOG_CAP = 1_000_000     # bytes; reset the file past this so it can't grow unbounded
+_LOG_CAP = 1_000_000
 
 
-def _log_to_file(line):
+def _log_to_file(path, line):
     try:
-        os.makedirs(os.path.dirname(LOG_PATH) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         try:
-            if os.path.getsize(LOG_PATH) > _LOG_CAP:
-                open(LOG_PATH, "w").close()
+            if os.path.getsize(path) > _LOG_CAP:
+                open(path, "w").close()
         except OSError:
             pass
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
     except Exception:  # noqa: BLE001 — logging must never break the agent
         pass
@@ -104,7 +98,7 @@ def _log_to_file(line):
 def _log(msg):
     line = f"[mc-spawn-agent] {msg}"
     print(line, flush=True)
-    _log_to_file(line)
+    _log_to_file(LOG_PATH, line)
 
 
 def _debug(msg):
@@ -112,91 +106,245 @@ def _debug(msg):
         _log(f"[debug] {msg}")
 
 
+# ---- local policy (owner-controlled; the backend can NEVER change it) ----
+#
+# Deny-by-default. Normal Minecraft operations are allowed out of the box so "сервер в пару
+# кликов" works; the genuinely dangerous/raw capabilities are off until the owner opts in by
+# editing policy.json. The agent reads this file but offers NO action to modify it (spec §7).
+
+POLICY_PATH = os.environ.get("AGENT_POLICY") or os.path.join(
+    os.path.dirname(STATE_PATH) or ".", "policy.json")
+
+# Actions allowed by default (the coarse allowlist). Unknown actions are always denied; the
+# dangerous ones below are ALSO gated by a per-action flag (allow_*), so listing them here is
+# necessary but not sufficient.
+_DEFAULT_ALLOWED_ACTIONS = [
+    "agent.health", "agent.capabilities", "agent.uninstall",
+    "minecraft.server.create", "minecraft.server.start", "minecraft.server.stop",
+    "minecraft.server.restart", "minecraft.server.status", "minecraft.server.logs",
+    "minecraft.server.delete", "minecraft.server.reconcile_status",
+    "minecraft.server.say", "minecraft.server.save_all",
+    "minecraft.server.console_tail", "minecraft.server.console_exec",
+    "minecraft.config.set_difficulty", "minecraft.config.set_gamemode",
+    "minecraft.player.list", "minecraft.player.whitelist_add",
+    "minecraft.player.whitelist_remove", "minecraft.player.whitelist_list",
+    "minecraft.player.kick",
+    "minecraft.backup.create", "minecraft.backup.list",
+    "minecraft.backup.delete", "minecraft.backup.restore",
+    "playit.claim_begin", "playit.claim_poll", "playit.playit_start",
+    "playit.ensure_tunnel", "playit.status", "playit.remove_tunnel", "playit.teardown",
+]
+
+_DEFAULT_POLICY = {
+    "policy_version": 1,
+    "workspace_root": os.path.expanduser(os.path.join("~", ".mc-spawn")),
+    "allowed_actions": _DEFAULT_ALLOWED_ACTIONS,
+    "max_ram_mb": 8192,
+    # The bot allocates one mc + one rcon port per server (max+1 from the itzg defaults), so we
+    # bound them to an inclusive range rather than an explicit list. Both mc and rcon ports must
+    # fall inside it. Narrow this to lock the agent to specific ports.
+    "allowed_port_range": [25565, 25700],
+    # Deletion of agent-created resources is allowed (scoped + the bot confirms exactly what is
+    # removed), but a cautious owner can switch these off.
+    "allow_server_delete": True,
+    "allow_agent_uninstall": True,
+    # Off by default — opt in to enable. The raw console is the WebApp live-console hook: with
+    # it OFF only safe semantic actions reach the server (the untrusted backend cannot send
+    # arbitrary console commands); the owner turns it on to drive a live console.
+    "allow_raw_rcon": False,
+    "allow_backup_restore": False,
+    "allow_plugins": False,
+    "allow_mods": False,
+    "allow_agent_auto_update": False,
+}
+
+# Read-only actions that always work regardless of allowed_actions, so the backend can discover
+# what this agent permits and the owner can monitor it.
+_ALWAYS_ALLOWED = {"agent.health", "agent.capabilities"}
+
+_POLICY_CACHE = None
+
+
+def _load_policy():
+    """Load policy.json over the conservative defaults (unknown keys ignored). Cached; a bad
+    file falls back to defaults with a warning — we never fail OPEN to a looser policy."""
+    global _POLICY_CACHE
+    if _POLICY_CACHE is not None:
+        return _POLICY_CACHE
+    policy = dict(_DEFAULT_POLICY)
+    try:
+        with open(POLICY_PATH) as f:
+            disk = json.load(f)
+        if isinstance(disk, dict):
+            for k, v in disk.items():
+                if k in _DEFAULT_POLICY:
+                    policy[k] = v
+        else:
+            _log(f"policy {POLICY_PATH} is not an object; using defaults")
+    except FileNotFoundError:
+        _debug(f"no policy file at {POLICY_PATH}; using built-in defaults")
+    except (OSError, ValueError) as e:
+        _log(f"policy load failed ({type(e).__name__}); using built-in defaults")
+    _POLICY_CACHE = policy
+    return policy
+
+
+def _policy(key):
+    return _load_policy().get(key, _DEFAULT_POLICY.get(key))
+
+
+def _workspace_root():
+    return os.path.abspath(_policy("workspace_root") or _DEFAULT_POLICY["workspace_root"])
+
+
+# ---- audit log (decisions only; never secrets, never scripts — scripts no longer exist) ----
+
+def _audit_path():
+    return os.path.join(_workspace_root(), "logs", "audit.log")
+
+
+def _audit(decision, action, request_id, reason=""):
+    extra = f" reason={reason}" if reason else ""
+    _log_to_file(_audit_path(), f"{decision} {action} request_id={request_id}{extra}")
+
+
+# ---- errors raised by capability handlers (mapped to result statuses by the dispatcher) ----
+
+class SecurityError(Exception):
+    """A path/scope violation — treated as a denial."""
+
+
+class PolicyDenied(Exception):
+    """Local policy forbids this action right now."""
+
+
+class CapabilityError(Exception):
+    """The allowed capability ran but failed (engine error, server not ready, ...)."""
+
+
+# ---- workspace path jail (spec §8) ----
+
+def safe_join(root, *parts):
+    """Join under `root` and refuse anything that escapes it (.. / absolute / symlink / drive
+    / UNC). Resolves symlinks so a link inside the workspace can't point outside."""
+    root = os.path.realpath(str(root))
+    candidate = os.path.realpath(os.path.join(root, *[str(p) for p in parts]))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        raise SecurityError("path escapes workspace")
+    return candidate
+
+
+def _ensure_workspace():
+    root = _workspace_root()
+    for sub in ("", "backups", "logs", "tmp"):
+        try:
+            os.makedirs(os.path.join(root, sub) if sub else root, exist_ok=True)
+        except OSError:
+            pass
+    return root
+
+
+# ---- container engine + safe subprocess wrapper (argv only, NEVER shell) ----
+
 _RUNTIME_CACHE = None
 
 
 def _runtime():
-    """The container engine to use. `CONTAINER_RUNTIME` env overrides; cached. On Windows
-    the engine lives INSIDE the WSL distro (see `_shell_argv`), not on the Windows PATH, so
-    we just use `docker` (what the installer puts in the distro) — Windows-side `shutil.which`
-    is irrelevant there. On Linux, auto-detect `docker → podman → nerdctl` on PATH (all share
-    the run/-p/-v/start/stop/rm/logs/inspect surface, so the engine is a drop-in), defaulting
-    to `docker`. The bot's scripts read it via `$MCSPAWN_RT`."""
+    """The container engine to use. `CONTAINER_RUNTIME` overrides; cached. Windows = `docker`
+    inside the WSL distro. Linux auto-detects docker → podman → nerdctl on PATH."""
     global _RUNTIME_CACHE
     if _RUNTIME_CACHE is not None:
         return _RUNTIME_CACHE
     override = os.environ.get("CONTAINER_RUNTIME", "").strip()
-    if override:
+    if override and override in _RUNTIMES:
         _RUNTIME_CACHE = override
     elif IS_WINDOWS:
-        _RUNTIME_CACHE = "docker"  # runs inside WSL; engine is the distro's docker
+        _RUNTIME_CACHE = "docker"
     else:
-        found = {rt: shutil.which(rt) for rt in ("docker", "podman", "nerdctl")}
-        _RUNTIME_CACHE = next((rt for rt, p in found.items() if p), "docker")
-        _debug(f"runtime detect: {found} -> {_RUNTIME_CACHE}")
+        _RUNTIME_CACHE = next((rt for rt in _RUNTIMES if shutil.which(rt)), "docker")
     return _RUNTIME_CACHE
+
+
+_RUNTIMES = ("docker", "podman", "nerdctl")
+
+
+def minimal_env(rt):
+    """A minimal, predictable environment for engine subprocesses (spec §9) — no inherited
+    user env leaks into containers. Carry only what docker/wsl actually need to function."""
+    keep = ("PATH", "HOME", "SystemRoot", "windir", "USERPROFILE", "LOCALAPPDATA",
+            "APPDATA", "TEMP", "TMP", "DOCKER_HOST", "XDG_RUNTIME_DIR")
+    env = {k: os.environ[k] for k in keep if k in os.environ}
+    env["MCSPAWN_RT"] = rt
+    return env
 
 
 _ENGINE_READY = False
 
 
 def _ensure_engine_ready():
-    """On Windows the engine lives in the WSL distro; start it + dockerd once per agent process
-    before the first container command and WAIT for the socket (idempotent). Tries the systemd
-    unit, then SysV, then `dockerd` directly — whichever the distro has — since neither the
-    distro nor the daemon auto-start reliably across reboots. We do NOT import the distro or
-    install docker here: that's the installer's slow one-time job; if the distro is missing this
-    fails fast and the next command's stderr makes the cause obvious. No-op on Linux."""
+    """On Windows the engine lives in the WSL distro; start dockerd once per process and wait
+    for its socket (argv only — no shell). No-op on Linux (systemd runs docker)."""
     global _ENGINE_READY
-    if _ENGINE_READY:
+    if _ENGINE_READY or not IS_WINDOWS:
+        _ENGINE_READY = True
         return
     _ENGINE_READY = True
-    if not IS_WINDOWS:
-        return
-    try:
-        # Start dockerd and wait for its socket (it takes a few seconds), so the very next
-        # container command doesn't race a not-yet-listening daemon. Exits 0 once `docker
-        # info` succeeds, non-zero if it never comes up.
-        wait = ("(systemctl start docker || service docker start || "
-                "(dockerd >/tmp/mcspawn-dockerd.log 2>&1 &)) >/dev/null 2>&1; i=0; "
-                "while [ $i -lt 40 ]; do docker info >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done; exit 1")
-        r = subprocess.run(
-            ["wsl", "-d", WSL_DISTRO, "--", "sh", "-lc", wait],
-            capture_output=True, text=True, timeout=180)
-        out = (r.stdout or r.stderr or "").strip()
-        if r.returncode == 0:
+    _run_internal(["wsl", "-d", WSL_DISTRO, "--", "service", "docker", "start"], timeout=60)
+    for _ in range(40):
+        r = _run_internal(["wsl", "-d", WSL_DISTRO, "--", "docker", "info"], timeout=20)
+        if r is not None and r.returncode == 0:
             _debug(f"wsl '{WSL_DISTRO}' docker ready")
-        else:
-            # Most likely the distro doesn't exist yet — hosting needs the installer's
-            # `wsl --import` + docker setup to have run.
-            _log(f"wsl distro '{WSL_DISTRO}' not ready: {out[-300:]!r} "
-                 f"(re-run the installer to set up WSL hosting)")
-    except Exception as e:  # noqa: BLE001 — never let engine bootstrap kill the agent
-        _debug(f"wsl docker start error: {type(e).__name__}: {e}")
+            return
+        time.sleep(1)
+    _log(f"wsl distro '{WSL_DISTRO}' docker not ready (re-run the installer to set up WSL hosting)")
 
 
-def _shell_argv(script):
-    """Pick the argv to run a bot-issued POSIX script (the bot emits `docker` one-liners —
-    see provisioner.py). On **Linux** that's `bash -c`. On **Windows** hosting runs inside
-    the dedicated WSL distro, so we route through `wsl -d <distro> -- bash -lc` — the script,
-    and the container engine it calls, execute as Linux inside the distro (where Docker
-    lives). This is the single place that pins "engine = WSL," so provisioning, reconcile,
-    lifecycle, `_uninstall`, and playit all follow. Override the whole shell with AGENT_SHELL
-    (e.g. for a non-WSL Windows setup)."""
-    override = os.environ.get("AGENT_SHELL")
-    if override:
-        return [override, "-c", script]
+def _run_internal(argv, timeout=60):
+    """Run an AGENT-CONSTANT argv (engine bootstrap, self-uninstall) — never a backend string,
+    never a shell. Returns CompletedProcess or None on failure. Used only for agent self-
+    maintenance; capability handlers use run_allowed."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except Exception as e:  # noqa: BLE001
+        _debug(f"internal {argv[:2]} failed: {type(e).__name__}: {e}")
+        return None
+
+
+def run_allowed(rt, args, timeout=ENGINE_TIMEOUT):
+    """Run a container-engine command as a fixed argv (spec §9): engine from the allowlist,
+    args are strings only, never through a shell, minimal env, cwd inside the workspace,
+    bounded. On Windows the engine runs inside the WSL distro: `wsl -d <distro> -- <rt> ...`."""
+    if rt not in _RUNTIMES:
+        raise SecurityError(f"engine '{rt}' not allowed")
+    if any(not isinstance(a, str) for a in args):
+        raise SecurityError("invalid argv (non-string element)")
+    root = _ensure_workspace()
     if IS_WINDOWS:
-        return ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script]
-    return ["bash", "-c", script]
+        argv = ["wsl", "-d", WSL_DISTRO, "--", rt, *args]
+    else:
+        argv = [shutil.which(rt) or rt, *args]
+    try:
+        return subprocess.run(
+            argv, cwd=root, env=minimal_env(rt), capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise CapabilityError("engine command timed out")
+    except FileNotFoundError:
+        raise CapabilityError("container engine not available — re-run the installer")
 
+
+def _bounded(text, limit=4000):
+    text = text or ""
+    return text[-limit:]
+
+
+# ---- HTTP transport to the control plane (unchanged wire shape; v2 rides in the body) ----
 
 def _http(method, path, body=None, secret=None, timeout=POLL_TIMEOUT):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(CONTROL_URL + path, data=data, method=method)
     req.add_header("User-Agent", USER_AGENT)
-    # Versioned contract + platform (Phase 6) — cheap headers on every call so the
-    # control plane can negotiate/record without changing any response shape.
     req.add_header("X-MC-Spawn-Protocol", str(PROTOCOL_VERSION))
     req.add_header("X-MC-Spawn-Platform", PLATFORM)
     if data is not None:
@@ -229,10 +377,6 @@ def _save_state(state):
 
 
 def _enroll():
-    """Redeem the one-time TOKEN for a long-lived secret. Returns the new secret,
-    or None if no token is set or enrollment was rejected — the caller decides
-    whether that is fatal. The enroll token is single-use (consumed server-side on
-    success), so a repeat attempt with a stale/used token correctly returns None."""
     if not TOKEN:
         _log("no stored creds and no TOKEN env - cannot enroll")
         return None
@@ -249,124 +393,452 @@ def _enroll():
     return data["secret"]
 
 
-# ---- command execution ----
+# ---- schema validation (spec §6): exact, deny unknown fields ----
 
-def _run_shell(payload):
+SERVER_ID_RE = r"^[a-zA-Z0-9_-]{1,32}$"
+PLAYER_NAME_RE = r"^[A-Za-z0-9_]{3,16}$"
+VERSION_RE = r"^[A-Za-z0-9._-]{1,16}$"
+MESSAGE_RE = r"^[^\x00-\x1f]{1,256}$"        # printable, no control chars
+BACKUP_ID_RE = r"^[a-zA-Z0-9_-]{1,48}$"
+TYPES = ("VANILLA", "PAPER", "FABRIC", "FORGE")
+DIFFICULTIES = ("peaceful", "easy", "normal", "hard")
+GAMEMODES = ("survival", "creative", "adventure", "spectator")
+
+_SERVER_ID = {"type": "string", "regex": SERVER_ID_RE}
+_PORT = {"type": "integer", "min": 1, "max": 65535}
+
+SCHEMAS = {
+    "agent.health": {"required": {}, "optional": {}},
+    "agent.capabilities": {"required": {}, "optional": {}},
+    "agent.uninstall": {"required": {}, "optional": {}},
+
+    "minecraft.server.create": {"required": {
+        "server_id": _SERVER_ID,
+        "kind": {"type": "string", "enum": TYPES},
+        "version": {"type": "string", "regex": VERSION_RE},
+        "ram_mb": {"type": "integer", "min": 512, "max": 16384},
+        "port": _PORT,
+        "rcon_port": _PORT,
+        "rcon_password": {"type": "string", "regex": r"^[A-Za-z0-9_\-]{8,128}$"},
+    }},
+    "minecraft.server.start": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.server.stop": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.server.restart": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.server.status": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.server.delete": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.server.logs": {
+        "required": {"server_id": _SERVER_ID},
+        "optional": {"lines": {"type": "integer", "min": 1, "max": 500}},
+    },
+    "minecraft.server.reconcile_status": {"required": {
+        "server_ids": {"type": "array", "items": {"type": "string", "regex": SERVER_ID_RE},
+                       "max_items": 64},
+    }},
+
+    "minecraft.server.say": {"required": {
+        "server_id": _SERVER_ID, "message": {"type": "string", "regex": MESSAGE_RE}}},
+    "minecraft.server.save_all": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.server.console_tail": {
+        "required": {"server_id": _SERVER_ID},
+        "optional": {"lines": {"type": "integer", "min": 1, "max": 500}}},
+    "minecraft.server.console_exec": {"required": {
+        "server_id": _SERVER_ID, "command": {"type": "string", "regex": MESSAGE_RE}}},
+
+    "minecraft.config.set_difficulty": {"required": {
+        "server_id": _SERVER_ID, "difficulty": {"type": "string", "enum": DIFFICULTIES}}},
+    "minecraft.config.set_gamemode": {"required": {
+        "server_id": _SERVER_ID, "gamemode": {"type": "string", "enum": GAMEMODES}}},
+
+    "minecraft.player.list": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.player.whitelist_add": {"required": {
+        "server_id": _SERVER_ID, "player": {"type": "string", "regex": PLAYER_NAME_RE}}},
+    "minecraft.player.whitelist_remove": {"required": {
+        "server_id": _SERVER_ID, "player": {"type": "string", "regex": PLAYER_NAME_RE}}},
+    "minecraft.player.whitelist_list": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.player.kick": {"required": {
+        "server_id": _SERVER_ID, "player": {"type": "string", "regex": PLAYER_NAME_RE}}},
+
+    "minecraft.backup.create": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.backup.list": {"required": {"server_id": _SERVER_ID}},
+    "minecraft.backup.delete": {"required": {
+        "server_id": _SERVER_ID, "backup_id": {"type": "string", "regex": BACKUP_ID_RE}}},
+    "minecraft.backup.restore": {"required": {
+        "server_id": _SERVER_ID, "backup_id": {"type": "string", "regex": BACKUP_ID_RE}}},
+
+    "playit.claim_begin": {"required": {}, "optional": {"local_port": _PORT}},
+    "playit.claim_poll": {"required": {"code": {"type": "string", "regex": r"^[a-f0-9]{1,32}$"}},
+                          "optional": {"local_port": _PORT}},
+    "playit.playit_start": {"required": {}, "optional": {"local_port": _PORT}},
+    "playit.ensure_tunnel": {"required": {"local_port": _PORT}},
+    "playit.status": {"required": {}, "optional": {"local_port": _PORT}},
+    "playit.remove_tunnel": {"required": {"local_port": _PORT}},
+    "playit.teardown": {"required": {}, "optional": {}},
+}
+
+
+def _check_field(value, spec):
+    t = spec.get("type")
+    if t == "integer":
+        if not (isinstance(value, int) and not isinstance(value, bool)):
+            return "not_integer"
+        if "min" in spec and value < spec["min"]:
+            return "below_min"
+        if "max" in spec and value > spec["max"]:
+            return "above_max"
+    elif t == "boolean":
+        if not isinstance(value, bool):
+            return "not_boolean"
+    elif t == "string":
+        if not isinstance(value, str):
+            return "not_string"
+        if "enum" in spec and value not in spec["enum"]:
+            return "not_in_enum"
+        if "regex" in spec and not re.fullmatch(spec["regex"], value):
+            return "regex_mismatch"
+    elif t == "array":
+        if not isinstance(value, list):
+            return "not_array"
+        if "max_items" in spec and len(value) > spec["max_items"]:
+            return "too_many_items"
+        item_spec = spec.get("items", {})
+        for item in value:
+            reason = _check_field(item, item_spec)
+            if reason:
+                return f"item_{reason}"
+    else:
+        return "unknown_type"
+    return None
+
+
+def validate_params(action, params):
+    """(ok, reason). Deny-by-default: unknown field, missing required, wrong type/range, or
+    a value outside the allowed set all fail. No additional properties are ever accepted."""
+    schema = SCHEMAS.get(action)
+    if schema is None:
+        return False, "no_schema"
+    required = schema.get("required", {})
+    optional = schema.get("optional", {})
+    known = set(required) | set(optional)
+    extra = sorted(set(params) - known)
+    if extra:
+        return False, f"unknown_field:{extra[0]}"
+    for name, spec in required.items():
+        if name not in params:
+            return False, f"missing:{name}"
+        reason = _check_field(params[name], spec)
+        if reason:
+            return False, f"{name}:{reason}"
+    for name, spec in optional.items():
+        if name in params:
+            reason = _check_field(params[name], spec)
+            if reason:
+                return False, f"{name}:{reason}"
+    return True, None
+
+
+# ---- resource naming (agent-derived; the backend never names a container/volume/path) ----
+
+MC_IMAGE = os.environ.get("MC_IMAGE", "itzg/minecraft-server")
+BACKUP_IMAGE = os.environ.get("BACKUP_IMAGE", "alpine")
+ALLOWED_IMAGES = {MC_IMAGE, BACKUP_IMAGE,
+                  os.environ.get("PLAYIT_IMAGE", "ghcr.io/playit-cloud/playit-agent:latest")}
+DEFAULT_MC_PORT = 25565
+CONTAINER_RCON_PORT = 25575
+SERVER_PREFIX = "mcspawn-server-"
+
+
+def _container_name(server_id):
+    if not re.fullmatch(SERVER_ID_RE, server_id):
+        raise SecurityError("invalid server_id")
+    return SERVER_PREFIX + server_id
+
+
+def _volume_name(server_id):
+    return _container_name(server_id) + "_data"
+
+
+def _enforce_port(port):
+    rng = _policy("allowed_port_range") or [0, 0]
+    if not (rng[0] <= port <= rng[1]):
+        raise PolicyDenied(f"port_not_allowed:{port}")
+
+
+def _enforce_ram(ram_mb):
+    cap = _policy("max_ram_mb") or 0
+    if ram_mb > cap:
+        raise PolicyDenied(f"max_ram_exceeded:{ram_mb}>{cap}")
+
+
+def _rcon_cli(server_id, *cmd_args):
+    """Run a Minecraft RCON command INSIDE the container via the image's `rcon-cli`. The agent
+    never handles the RCON password — rcon-cli reads it from the container's own env — and the
+    args are a fixed argv, so there is no shell and no injection (spec §11)."""
+    container = _container_name(server_id)
+    _ensure_engine_ready()
+    r = run_allowed(_runtime(), ["exec", container, "rcon-cli", *cmd_args], timeout=20)
+    if r.returncode != 0:
+        raise CapabilityError(_bounded(r.stderr or r.stdout, 400).strip() or "rcon failed")
+    return _bounded(r.stdout, 1500).strip()
+
+
+# ---- capability handlers (hardcoded; each returns the result payload dict) ----
+
+def act_health(params):
+    return {"status": "ok", "agent_version": AGENT_VERSION,
+            "platform": PLATFORM, "engine": _runtime()}
+
+
+def act_capabilities(params):
+    policy = _load_policy()
+    allowed = [a for a in ACTION_REGISTRY if a in set(policy["allowed_actions"]) | _ALWAYS_ALLOWED]
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "agent_version": AGENT_VERSION,
+        "policy_version": policy.get("policy_version", 1),
+        "allowed_actions": allowed,
+        "limits": {
+            "max_ram_mb": policy["max_ram_mb"],
+            "allowed_port_range": policy["allowed_port_range"],
+            "allow_server_delete": policy["allow_server_delete"],
+            "allow_agent_uninstall": policy["allow_agent_uninstall"],
+            "allow_raw_rcon": policy["allow_raw_rcon"],
+            "allow_backup_restore": policy["allow_backup_restore"],
+            "allow_plugins": policy["allow_plugins"],
+            "allow_mods": policy["allow_mods"],
+        },
+    }
+
+
+def act_server_create(params):
+    sid = params["server_id"]
+    _enforce_ram(params["ram_mb"])
+    _enforce_port(params["port"])
+    _enforce_port(params["rcon_port"])
+    container = _container_name(sid)
+    rt = _runtime()
+    _ensure_engine_ready()
+    run_allowed(rt, ["rm", "-f", container], timeout=60)   # idempotent recreate
+    args = [
+        "run", "-d", "--name", container,
+        "-e", "EULA=TRUE", "-e", f"TYPE={params['kind']}", "-e", f"VERSION={params['version']}",
+        "-e", f"MEMORY={int(params['ram_mb'])}M",
+        "-e", "ENABLE_RCON=true", "-e", f"RCON_PASSWORD={params['rcon_password']}",
+        "-e", f"RCON_PORT={CONTAINER_RCON_PORT}",
+        "-p", f"{int(params['port'])}:{DEFAULT_MC_PORT}",
+        "-p", f"127.0.0.1:{int(params['rcon_port'])}:{CONTAINER_RCON_PORT}",
+        "-v", f"{_volume_name(sid)}:/data", "--restart", "unless-stopped",
+        MC_IMAGE,
+    ]
+    r = run_allowed(rt, args)
+    if r.returncode != 0:
+        raise CapabilityError(_bounded(r.stderr, 600).strip() or "create failed")
+    return {"server_id": sid, "container": container, "state": "running"}
+
+
+def _lifecycle(verb, state):
+    def handler(params):
+        container = _container_name(params["server_id"])
+        _ensure_engine_ready()
+        r = run_allowed(_runtime(), [verb, container], timeout=60)
+        if r.returncode != 0:
+            raise CapabilityError(_bounded(r.stderr, 400).strip() or f"{verb} failed")
+        return {"server_id": params["server_id"], "state": state}
+    return handler
+
+
+def act_server_status(params):
+    container = _container_name(params["server_id"])
+    _ensure_engine_ready()
+    r = run_allowed(_runtime(), ["inspect", "-f", "{{.State.Status}}", container], timeout=30)
+    status = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "missing"
+    return {"server_id": params["server_id"], "status": status}
+
+
+def act_server_logs(params):
+    container = _container_name(params["server_id"])
+    lines = params.get("lines", 30)
+    _ensure_engine_ready()
+    r = run_allowed(_runtime(), ["logs", "--tail", str(int(lines)), container], timeout=30)
+    return {"server_id": params["server_id"], "logs": _bounded((r.stdout or "") + (r.stderr or ""))}
+
+
+def act_server_delete(params):
+    if not _policy("allow_server_delete"):
+        raise PolicyDenied("server_delete_disabled")
+    sid = params["server_id"]
+    container = _container_name(sid)
+    rt = _runtime()
+    _ensure_engine_ready()
+    run_allowed(rt, ["rm", "-f", container], timeout=60)
+    run_allowed(rt, ["volume", "rm", _volume_name(sid)], timeout=60)
+    return {"server_id": sid, "deleted": True}
+
+
+def act_reconcile_status(params):
+    """Batch probe for the bot's reconciler (replaces the old inspect_states_cmd shell). Reports
+    an engine-health sentinel so the bot never mistakes a momentarily-down engine for a missing
+    container, plus per-server status and the playit container's status."""
+    rt = _runtime()
+    _ensure_engine_ready()
+    info = run_allowed(rt, ["info"], timeout=30)
+    engine = "up" if info.returncode == 0 else "down"
+    servers = {}
+    if engine == "up":
+        for sid in params["server_ids"]:
+            c = _container_name(sid)
+            r = run_allowed(rt, ["inspect", "-f", "{{.State.Status}}", c], timeout=20)
+            servers[sid] = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "missing"
+        pr = run_allowed(rt, ["inspect", "-f", "{{.State.Status}}", PLAYIT_CONTAINER], timeout=20)
+        playit = pr.stdout.strip() if pr.returncode == 0 and pr.stdout.strip() else "missing"
+    else:
+        playit = "unknown"
+    return {"engine": engine, "servers": servers, "playit": playit}
+
+
+def act_say(params):
+    return {"server_id": params["server_id"], "text": _rcon_cli(params["server_id"], "say", params["message"])}
+
+
+def act_save_all(params):
+    return {"server_id": params["server_id"], "text": _rcon_cli(params["server_id"], "save-all")}
+
+
+def act_set_difficulty(params):
+    return {"server_id": params["server_id"],
+            "text": _rcon_cli(params["server_id"], "difficulty", params["difficulty"])}
+
+
+def act_set_gamemode(params):
+    return {"server_id": params["server_id"],
+            "text": _rcon_cli(params["server_id"], "defaultgamemode", params["gamemode"])}
+
+
+def act_player_list(params):
+    return {"server_id": params["server_id"], "ok": True,
+            "text": _rcon_cli(params["server_id"], "list")}
+
+
+def act_whitelist_add(params):
+    return {"server_id": params["server_id"], "player": params["player"],
+            "text": _rcon_cli(params["server_id"], "whitelist", "add", params["player"])}
+
+
+def act_whitelist_remove(params):
+    return {"server_id": params["server_id"], "player": params["player"],
+            "text": _rcon_cli(params["server_id"], "whitelist", "remove", params["player"])}
+
+
+def act_whitelist_list(params):
+    return {"server_id": params["server_id"], "text": _rcon_cli(params["server_id"], "whitelist", "list")}
+
+
+def act_kick(params):
+    return {"server_id": params["server_id"], "player": params["player"],
+            "text": _rcon_cli(params["server_id"], "kick", params["player"])}
+
+
+def act_console_tail(params):
+    """Read-only live console output (= the server's stdout). Safe; not gated (logs are already
+    available). The matching write path, console_exec, IS gated."""
+    return act_server_logs(params)
+
+
+def act_console_exec(params):
+    """Raw console command — the WebApp live-console write path. Gated OFF by default: the
+    backend is untrusted, so a free-form console command is only relayed when the OWNER has
+    opted in via policy allow_raw_rcon (spec §11)."""
+    if not _policy("allow_raw_rcon"):
+        raise PolicyDenied("raw_console_disabled")
+    return {"server_id": params["server_id"], "text": _rcon_cli(params["server_id"], params["command"])}
+
+
+# ---- backups (workspace-jailed; restore is gated) ----
+
+def _backups_dir(server_id):
+    return safe_join(_ensure_workspace(), "backups", server_id)
+
+
+def act_backup_create(params):
+    sid = params["server_id"]
+    dest = _backups_dir(sid)
+    os.makedirs(dest, exist_ok=True)
+    backup_id = time.strftime("%Y%m%d-%H%M%S")
+    out_path = safe_join(dest, backup_id + ".tgz")
+    rt = _runtime()
+    _ensure_engine_ready()
+    # tar the named world volume into the workspace via a throwaway container (named volume in,
+    # workspace-scoped bind mount out — spec §10). No host paths beyond the workspace are mounted.
+    r = run_allowed(rt, [
+        "run", "--rm", "-v", f"{_volume_name(sid)}:/data:ro", "-v", f"{dest}:/backup",
+        BACKUP_IMAGE, "tar", "czf", f"/backup/{backup_id}.tgz", "-C", "/data", ".",
+    ])
+    if r.returncode != 0:
+        raise CapabilityError(_bounded(r.stderr, 400).strip() or "backup failed")
+    size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    return {"server_id": sid, "backup_id": backup_id, "size_bytes": size}
+
+
+def act_backup_list(params):
+    sid = params["server_id"]
+    dest = _backups_dir(sid)
+    items = []
+    if os.path.isdir(dest):
+        for name in sorted(os.listdir(dest)):
+            if name.endswith(".tgz"):
+                p = safe_join(dest, name)
+                items.append({"backup_id": name[:-4], "size_bytes": os.path.getsize(p)})
+    return {"server_id": sid, "backups": items}
+
+
+def act_backup_delete(params):
+    sid = params["server_id"]
+    path = safe_join(_backups_dir(sid), params["backup_id"] + ".tgz")
     try:
-        # Expose the detected container engine to the bot's POSIX scripts as $MCSPAWN_RT
-        # (they call `${MCSPAWN_RT:-docker} …`), so one script set runs on docker/podman/
-        # nerdctl without the bot knowing what's installed on the box (Phase 6.5).
-        rt = _runtime()
-        _ensure_engine_ready()   # Windows/podman: make sure the WSL machine is up first
-        env = {**os.environ, "MCSPAWN_RT": rt}
-        argv = _shell_argv(payload["script"])
-        p = subprocess.run(
-            argv, capture_output=True, text=True, timeout=SHELL_TIMEOUT, env=env,
-        )
-        # Log the OUTCOME (exit + stderr tail), never the script — it carries the RCON
-        # password. stderr from the engine is safe and is exactly what you need to see a
-        # failure like "Cannot connect to Podman" or "image not found".
-        if p.returncode not in (0, None):
-            _log(f"shell exit={p.returncode} via {argv[0]} rt={rt}; "
-                 f"stderr={p.stderr.strip()[-600:]!r}")
-        else:
-            _debug(f"shell ok via {argv[0]} rt={rt}; stdout={p.stdout.strip()[-600:]!r}")
-        return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-4000:]}
-    except subprocess.TimeoutExpired:
-        _log(f"shell timeout after {SHELL_TIMEOUT}s")
-        return {"exit": None, "stdout": "", "stderr": "timeout"}
-    except Exception as e:  # noqa: BLE001
-        _log(f"shell failed to launch: {type(e).__name__}: {e}")
-        return {"exit": None, "stdout": "", "stderr": type(e).__name__}
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    return {"server_id": sid, "backup_id": params["backup_id"], "deleted": True}
 
 
-def _recvn(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("short read")
-        buf += chunk
-    return buf
+def act_backup_restore(params):
+    if not _policy("allow_backup_restore"):
+        raise PolicyDenied("backup_restore_disabled")
+    sid = params["server_id"]
+    src = safe_join(_backups_dir(sid), params["backup_id"] + ".tgz")
+    if not os.path.exists(src):
+        raise CapabilityError("backup not found")
+    dest = _backups_dir(sid)
+    vol = _volume_name(sid)
+    tar_in = f"/backup/{params['backup_id']}.tgz"   # backup_id is regex-validated + path-jailed
+    rt = _runtime()
+    _ensure_engine_ready()
+    # Two fixed argv container runs (no shell): clear the world volume, then extract the backup
+    # into it. The named volume goes in and a workspace-scoped backups dir comes in read-only.
+    clear = run_allowed(rt, ["run", "--rm", "-v", f"{vol}:/data", BACKUP_IMAGE,
+                             "find", "/data", "-mindepth", "1", "-delete"])
+    if clear.returncode != 0:
+        raise CapabilityError(_bounded(clear.stderr, 400).strip() or "restore (clear) failed")
+    r = run_allowed(rt, ["run", "--rm", "-v", f"{vol}:/data", "-v", f"{dest}:/backup:ro",
+                         BACKUP_IMAGE, "tar", "xzf", tar_in, "-C", "/data"])
+    if r.returncode != 0:
+        raise CapabilityError(_bounded(r.stderr, 400).strip() or "restore failed")
+    return {"server_id": sid, "backup_id": params["backup_id"], "restored": True}
 
 
-def _rcon(payload):
-    """Minimal Source RCON client (stdlib) to 127.0.0.1 — the server is local."""
-    host, port = "127.0.0.1", int(payload["rcon_port"])
-    password, command = payload["password"], payload["command"]
-
-    def pkt(rid, ptype, body):
-        p = struct.pack("<ii", rid, ptype) + body.encode() + b"\x00\x00"
-        return struct.pack("<i", len(p)) + p
-
-    def recv(sock):
-        (ln,) = struct.unpack("<i", _recvn(sock, 4))
-        data = _recvn(sock, ln)
-        rid, ptype = struct.unpack("<ii", data[:8])
-        return rid, ptype, data[8:-2].decode("utf-8", "replace")
-
-    try:
-        s = socket.create_connection((host, port), timeout=10)
-        s.settimeout(10)
-        s.sendall(pkt(1, 3, password))
-        rid, _t, _b = recv(s)
-        if rid == -1:
-            s.close()
-            return {"ok": False, "text": "Неверный RCON-пароль."}
-        s.sendall(pkt(2, 2, command))
-        _rid, _t2, text = recv(s)
-        s.close()
-        return {"ok": True, "text": text.strip()[:1500]}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "text": f"RCON недоступен ({type(e).__name__})."}
-
-
-# ---- playit.gg public address (Phase 3) ----
-#
-# The user links their OWN free playit account (claim flow) — the operator never holds
-# the account, which keeps us ToS-clean (no resale). The agent then runs the playit
-# agent under that secret (docker, host network so it reaches the local MC port) and
-# reads the assigned public address from playit's API. The secret stays on this box,
-# chmod 600, and is never sent to the control plane.
-#
-# playit HTTP API (https://api.playit.gg) — JSON, enveloped {"status":"success","data":..}:
-#   POST /claim/setup     {code, agent_type:"self-managed", version}
-#                           -> "WaitingForUser*" | "UserAccepted" | "UserRejected"
-#   POST /claim/exchange  {code} -> {secret_key}          (once the user approves)
-#   POST /v1/agents/rundata  (auth: "Agent-Key <secret>")
-#                           -> {agent_id, tunnels:[{display_address,..}], pending:[..]}
+# ---- playit.gg public address (per-port tunnels; user links their OWN account) ----
 
 PLAYIT_API = os.environ.get("PLAYIT_API", "https://api.playit.gg").rstrip("/")
 PLAYIT_IMAGE = os.environ.get("PLAYIT_IMAGE", "ghcr.io/playit-cloud/playit-agent:latest")
 PLAYIT_CONTAINER = "mc-spawn-playit"
 PLAYIT_KEY_PATH = os.path.join(os.path.dirname(STATE_PATH) or ".", "playit.key")
-# playit checks this at /claim/setup and remembers it as the agent's version; a bad/old
-# value makes a later /tunnels/create fail with `AgentVersionTooOld`. The real client
-# sends "playit <semver>" (format!("playit {}", CARGO_PKG_VERSION)), so we MUST mimic that
-# exact shape with a current version — not "mc-spawn-agent". Bump as playit's minimum rises;
-# overridable via env. (The playit docker container itself reports its own real version once
-# it connects, but we may create the tunnel before that, so the claim version must be valid.)
 PLAYIT_VERSION = os.environ.get("PLAYIT_VERSION", "playit 1.0.9")
 
 
 def _playit_local_ip():
-    """Address the playit container uses to reach the local MC server's published port.
-    Everything runs inside Linux (native Linux, or the WSL distro on Windows), where playit
-    uses `--network host`, so the loopback `127.0.0.1:<mc_port>` is correct on both. Override
-    with PLAYIT_LOCAL_IP."""
     return os.environ.get("PLAYIT_LOCAL_IP") or "127.0.0.1"
 
 
-def _playit_net_args():
-    """Docker networking flags for the playit container: host network. Runs inside Linux on
-    both platforms (the WSL distro on Windows), so `--network host` reaches the MC port on
-    127.0.0.1 — no Docker-Desktop `host.docker.internal` shim needed."""
-    return ["--network", "host"]
-
-
 def _playit_api(path, body, secret=None):
-    """POST to the playit API; return (ok, data). Never raises — `ok` is False on any
-    transport/HTTP error or a non-success envelope."""
     data = json.dumps(body).encode()
     req = urllib.request.Request(PLAYIT_API + path, data=data, method="POST")
     req.add_header("User-Agent", USER_AGENT)
@@ -404,25 +876,19 @@ def _save_playit_secret(secret):
 
 
 def _playit_rundata(secret):
-    """Raw agent run-data (tunnels, pending, agent_id) or None on error."""
     ok, data = _playit_api("/v1/agents/rundata", {}, secret=secret)
     return data if ok and isinstance(data, dict) else None
 
 
 def _tunnel_name(local_port):
-    """Each hosted server gets its OWN tunnel, keyed by its box-local port, so several
-    servers on one machine don't collide on a single shared tunnel/address."""
     return f"mc-spawn-{int(local_port)}" if local_port else "mc-spawn"
 
 
 def _is_ours(name):
-    """A tunnel WE created (vs one the user made by hand)."""
     return name == "mc-spawn" or (name or "").startswith("mc-spawn-")
 
 
 def _port_address(data, local_port):
-    """(address_or_None, pending_bool) for OUR tunnel matching this local port. With no
-    port (legacy / no-arg call) match any tunnel we created."""
     want = _tunnel_name(local_port) if local_port else None
 
     def mine(t):
@@ -439,98 +905,65 @@ def _port_address(data, local_port):
 
 
 def _playit_address(secret, local_port):
-    """(address_or_None, pending_bool) for this port from the user's playit account."""
     data = _playit_rundata(secret)
     return _port_address(data, local_port) if data is not None else (None, False)
 
 
 def _playit_create_tunnel(secret, agent_id, local_port):
-    """Create a Minecraft-Java tunnel pointing at the local server, so the user never
-    has to make one on playit's (English) dashboard. Free shared-IP allocation
-    (alloc=None). Returns (ok, error_str_or_None).
-
-    Wire format from playit-agent's api_client (POST /tunnels/create, auth header
-    `Agent-Key <secret>` — same as rundata). origin.type=agent maps the public
-    tunnel to 127.0.0.1:<local_port> on this box."""
     body = {
-        "name": _tunnel_name(local_port),
-        "tunnel_type": "minecraft-java",
-        "port_type": "tcp",
-        "port_count": 1,
+        "name": _tunnel_name(local_port), "tunnel_type": "minecraft-java",
+        "port_type": "tcp", "port_count": 1,
         "origin": {"type": "agent", "data": {
             "agent_id": agent_id, "local_ip": _playit_local_ip(), "local_port": int(local_port)}},
-        "enabled": True,
-        "alloc": None,
-        "firewall_id": None,
-        "proxy_protocol": None,
+        "enabled": True, "alloc": None, "firewall_id": None, "proxy_protocol": None,
     }
     ok, data = _playit_api("/tunnels/create", body, secret=secret)
     if ok:
         return True, None
-    # playit returns the error as a bare enum string (e.g. "RequiresVerifiedAccount").
     err = data if isinstance(data, str) else (data.get("error") if isinstance(data, dict) else None)
     return False, err
 
 
 def _playit_delete_tunnels(secret, local_port=None):
-    """Delete the tunnels WE created. With `local_port`, only that one server's tunnel;
-    otherwise all of ours (machine teardown). Best-effort; never raises. Only touches
-    our own tunnels — any the user made by hand are left alone."""
     data = _playit_rundata(secret)
     if not data:
         return
     target = _tunnel_name(local_port) if local_port else None
     for t in data.get("tunnels", []):
         name = t.get("name") or ""
-        if not _is_ours(name):
-            continue
-        if target is not None and name != target:
+        if not _is_ours(name) or (target is not None and name != target):
             continue
         tid = t.get("id") or t.get("tunnel_id")
         if tid:
-            # playit-agent's api_client: POST /tunnels/delete {tunnel_id}.
             _playit_api("/tunnels/delete", {"tunnel_id": tid}, secret=secret)
 
 
+def _playit_run(secret):
+    """(Re)start the playit container on the host network via the engine (argv only). The fixed
+    container name is agent-owned; the image is on the allowlist."""
+    _ensure_engine_ready()
+    rt = _runtime()
+    run_allowed(rt, ["rm", "-f", PLAYIT_CONTAINER], timeout=60)
+    r = run_allowed(rt, [
+        "run", "-d", "--name", PLAYIT_CONTAINER, "--restart", "unless-stopped",
+        "--network", "host", "-e", f"SECRET_KEY={secret}", PLAYIT_IMAGE,
+    ])
+    return r.returncode == 0
+
+
 def _playit_teardown():
-    """Tear playit down on this box: delete our tunnels, stop+remove the playit
-    container, drop the stored secret. Idempotent and never raises (docker/key may
-    be absent) so machine/server deletion always proceeds."""
     secret = _playit_secret()
     if secret:
         _playit_delete_tunnels(secret)
-    # Through the shell (→ WSL on Windows) so we hit the SAME engine that started it; a
-    # direct subprocess([rt,…]) would miss the WSL Docker and leave the container behind.
-    _run_shell({"script": f"${{MCSPAWN_RT:-docker}} rm -f {PLAYIT_CONTAINER} 2>/dev/null; true"})
+    _ensure_engine_ready()
+    run_allowed(_runtime(), ["rm", "-f", PLAYIT_CONTAINER], timeout=60)
     try:
         os.remove(PLAYIT_KEY_PATH)
     except OSError:
         pass
 
 
-def _playit_run(secret):
-    """(Re)start the playit agent under the user's secret via the engine, on the host
-    network (so it reaches 127.0.0.1:<mc_port>). Runs through the shell (→ WSL on Windows),
-    so it uses the distro's Docker. Idempotent; never raises — returns False on any failure
-    so the playit op stays soft. The secret is shell-quoted and never logged (the script
-    text isn't logged; only engine stderr/stdout, which don't echo it)."""
-    net = " ".join(_playit_net_args())
-    script = (
-        f"${{MCSPAWN_RT:-docker}} rm -f {PLAYIT_CONTAINER} 2>/dev/null; "
-        f"${{MCSPAWN_RT:-docker}} run -d --name {PLAYIT_CONTAINER} --restart unless-stopped "
-        f"{net} -e SECRET_KEY={shlex.quote(secret)} {shlex.quote(PLAYIT_IMAGE)}"
-    )
-    return _run_shell({"script": script}).get("exit") == 0
-
-
-# rundata reflects a just-created tunnel only after a few seconds of propagation. Within that
-# gap a retried/relaunched ensure_tunnel — the bot's acquire loop on resume, or a SECOND bot
-# replica (all of which funnel to THIS one agent process, run serially) — would create a
-# DUPLICATE tunnel. So remember the ports we just created a tunnel for and treat them as done
-# until rundata catches up. In-memory is enough: the agent is the single chokepoint per machine,
-# and a (rare) agent restart within the window self-heals (rundata has caught up by then).
-# Cleared when the tunnel is deleted so a later re-create still works.
-_TUNNEL_CREATE_GUARD: dict[int, float] = {}
+_TUNNEL_CREATE_GUARD = {}
 _TUNNEL_CREATE_GUARD_SEC = 120
 
 
@@ -541,222 +974,392 @@ def _recently_created_tunnel(local_port):
     return ts is not None and (time.monotonic() - ts) < _TUNNEL_CREATE_GUARD_SEC
 
 
-def _playit(payload):
-    """Link/report a server's playit public address. The ops are SMALL and quick so the
-    BOT can drive pacing and show live progress (it loops claim_poll / status, editing the
-    message each tick) instead of one multi-minute call that looks frozen. Per-port:
-    each hosted server has its own tunnel keyed by `local_port`. Never raises.
+def act_playit_claim_begin(params):
+    if _playit_secret():
+        return {"status": "linked"}
+    code = os.urandom(5).hex()
+    ok, _ = _playit_api("/claim/setup", {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
+    if not ok:
+        return {"status": "error", "error": "playit недоступен"}
+    return {"status": "begin", "code": code, "url": "https://playit.gg/claim/" + code}
 
-    Ops: claim_begin (mint code/url, or 'linked'); claim_poll (one quick approval check,
-    exchanges+saves the secret on accept); playit_start (run playit + ensure this port's
-    tunnel, fast); status (read this port's address, auto-creating its tunnel);
-    remove_tunnel (delete just this port's tunnel); teardown (full cleanup)."""
-    op = payload.get("op")
-    local_port = payload.get("local_port")
-    secret = _playit_secret()
 
-    if op == "teardown":
-        _playit_teardown()
-        _TUNNEL_CREATE_GUARD.clear()
-        return {"status": "ok"}
-    if op == "remove_tunnel":
-        if secret:
-            _playit_delete_tunnels(secret, local_port)
-        if local_port:
-            _TUNNEL_CREATE_GUARD.pop(int(local_port), None)  # so a later ensure re-creates it
-        return {"status": "ok"}
-    if op == "claim_begin":
-        if secret:
-            return {"status": "linked"}  # already linked; bot goes straight to address stage
-        code = os.urandom(5).hex()  # matches playit's claim-code format (5 bytes hex)
-        ok, _ = _playit_api(
-            "/claim/setup", {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
-        if not ok:
-            return {"status": "error", "error": "playit недоступен"}
-        return {"status": "begin", "code": code, "url": "https://playit.gg/claim/" + code}
-    if op == "claim_poll":
-        # One quick check of the browser-approval state — the bot loops this with its own
-        # pacing + a live "waiting…" message, so nothing blocks for minutes here.
-        if secret:
-            return {"status": "accepted"}  # already linked
-        code = payload.get("code", "")
-        _ok, state = _playit_api(
-            "/claim/setup", {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
-        if state == "UserRejected":
-            return {"status": "rejected"}
-        # playit's claim is TWO site steps; surface which one is still pending so the bot
-        # can tell the user exactly what to do (open the link vs. approve it on the page).
-        if state == "WaitingForUserVisit":
-            return {"status": "waiting", "stage": "visit"}
-        if state != "UserAccepted":  # WaitingForUser (or anything not-yet-accepted)
-            return {"status": "waiting", "stage": "approve"}
-        ok, data = _playit_api("/claim/exchange", {"code": code})
-        if not ok or not isinstance(data, dict) or not data.get("secret_key"):
-            return {"status": "waiting", "stage": "approve"}
-        _save_playit_secret(data["secret_key"])
+def act_playit_claim_poll(params):
+    if _playit_secret():
         return {"status": "accepted"}
-    if op == "playit_start":
-        # Just ensure the playit container is running. Tunnel creation is a SEPARATE,
-        # retryable op (`ensure_tunnel`) the bot loops — because on first run the container
-        # must connect to playit before `/tunnels/create` is accepted (otherwise the very
-        # first create fails and, with a read-only status poll, would never be retried).
-        secret = _playit_secret()
-        if not secret:
-            return {"status": "unlinked"}
-        if not _playit_run(secret):
-            return {"status": "error", "error": "не удалось запустить playit (docker)"}
-        return {"status": "ok"}
-    if op == "ensure_tunnel":
-        # ONE create-or-detect attempt (fast; the bot loops it). Idempotent: never creates
-        # if this port already has a tunnel. `connecting` ⇒ "retry later" (playit API/agent
-        # not ready yet, incl. the transient AgentVersionTooOld while the container connects);
-        # the bot keeps looping until `created`/`exists`, so creation isn't a one-shot.
-        if not secret:
-            return {"status": "unlinked"}
-        data = _playit_rundata(secret)
-        if data is None:
-            return {"status": "connecting"}
-        addr, pending = _port_address(data, local_port)
-        if addr:
-            if local_port:
-                _TUNNEL_CREATE_GUARD.pop(int(local_port), None)  # rundata caught up
-            return {"status": "exists", "address": addr}
-        if pending:
-            if local_port:
-                _TUNNEL_CREATE_GUARD.pop(int(local_port), None)
-            return {"status": "exists"}
-        if _recently_created_tunnel(local_port):
-            # We created this port's tunnel moments ago; rundata just hasn't shown it yet.
-            # Reporting `created` (NOT a 2nd /tunnels/create) is what kills the duplicate.
-            return {"status": "created"}
-        agent_id = data.get("agent_id")
-        if not agent_id:
-            return {"status": "connecting"}
-        if not local_port:
-            return {"status": "error", "error": "no local_port"}
-        ok, err = _playit_create_tunnel(secret, agent_id, local_port)
-        if ok:
-            _TUNNEL_CREATE_GUARD[int(local_port)] = time.monotonic()
-            return {"status": "created"}
-        if err == "AgentVersionTooOld":
-            return {"status": "connecting"}
-        return {"status": "error", "error": err or "не удалось создать туннель"}
-    if op == "status":
-        if not secret:
-            return {"status": "unlinked"}
-        # READ-ONLY: never creates (creation is ensure_tunnel's job). Just reports this
-        # port's address once its tunnel has one.
-        addr, _pending = _playit_address(secret, local_port)
-        return {"status": "ok" if addr else "no_tunnel", "address": addr}
-    return {"status": "error", "error": f"unknown playit op {op}"}
+    code = params["code"]
+    _ok, state = _playit_api("/claim/setup", {"code": code, "agent_type": "self-managed", "version": PLAYIT_VERSION})
+    if state == "UserRejected":
+        return {"status": "rejected"}
+    if state == "WaitingForUserVisit":
+        return {"status": "waiting", "stage": "visit"}
+    if state != "UserAccepted":
+        return {"status": "waiting", "stage": "approve"}
+    ok, data = _playit_api("/claim/exchange", {"code": code})
+    if not ok or not isinstance(data, dict) or not data.get("secret_key"):
+        return {"status": "waiting", "stage": "approve"}
+    _save_playit_secret(data["secret_key"])
+    return {"status": "accepted"}
 
 
-# ---- full self-uninstall (Phase 6.5) ----
-#
-# When the user deletes the machine in the bot, the agent removes EVERYTHING it put on
-# the box and then itself: MC containers + their world volumes, the playit container +
-# tunnels, the service/Scheduled-Task, and its own files. Containers + playit are torn
-# down synchronously (reliable); the service + files are removed by a DETACHED helper
-# so it survives the agent's own death when the service is stopped (and, on Windows,
-# can delete agent.py which is locked while running). Best-effort + idempotent.
+def act_playit_start(params):
+    secret = _playit_secret()
+    if not secret:
+        return {"status": "unlinked"}
+    if not _playit_run(secret):
+        return {"status": "error", "error": "не удалось запустить playit (docker)"}
+    return {"status": "ok"}
+
+
+def act_playit_ensure_tunnel(params):
+    secret = _playit_secret()
+    local_port = params["local_port"]
+    if not secret:
+        return {"status": "unlinked"}
+    data = _playit_rundata(secret)
+    if data is None:
+        return {"status": "connecting"}
+    addr, pending = _port_address(data, local_port)
+    if addr:
+        _TUNNEL_CREATE_GUARD.pop(int(local_port), None)
+        return {"status": "exists", "address": addr}
+    if pending:
+        _TUNNEL_CREATE_GUARD.pop(int(local_port), None)
+        return {"status": "exists"}
+    if _recently_created_tunnel(local_port):
+        return {"status": "created"}
+    agent_id = data.get("agent_id")
+    if not agent_id:
+        return {"status": "connecting"}
+    ok, err = _playit_create_tunnel(secret, agent_id, local_port)
+    if ok:
+        _TUNNEL_CREATE_GUARD[int(local_port)] = time.monotonic()
+        return {"status": "created"}
+    if err == "AgentVersionTooOld":
+        return {"status": "connecting"}
+    return {"status": "error", "error": err or "не удалось создать туннель"}
+
+
+def act_playit_status(params):
+    secret = _playit_secret()
+    if not secret:
+        return {"status": "unlinked"}
+    addr, _pending = _playit_address(secret, params.get("local_port"))
+    return {"status": "ok" if addr else "no_tunnel", "address": addr}
+
+
+def act_playit_remove_tunnel(params):
+    secret = _playit_secret()
+    local_port = params["local_port"]
+    if secret:
+        _playit_delete_tunnels(secret, local_port)
+    _TUNNEL_CREATE_GUARD.pop(int(local_port), None)
+    return {"status": "ok"}
+
+
+def act_playit_teardown(params):
+    _playit_teardown()
+    _TUNNEL_CREATE_GUARD.clear()
+    return {"status": "ok"}
+
+
+# ---- agent self-uninstall (scoped: removes ONLY agent-owned resources + itself) ----
 
 SERVICE_NAME = "mc-spawn-agent"
 
 
-def _uninstall(payload):
-    for c in payload.get("containers", []):
-        # Run via the SAME shell as provisioning (`_run_shell` → `_shell_argv`, which is
-        # `wsl -d <distro>` on Windows), so we hit the engine that created these containers
-        # (the distro's Docker). A direct subprocess([rt, ...]) would call a Windows-side
-        # engine that doesn't exist and orphan the containers. `${MCSPAWN_RT:-docker}`
-        # resolves the engine exactly like the bot's scripts do.
-        _run_shell({"script":
-            f"${{MCSPAWN_RT:-docker}} rm -f {c} 2>/dev/null; "
-            f"${{MCSPAWN_RT:-docker}} volume rm {c}_data 2>/dev/null; true"})
+def act_uninstall(params):
+    if not _policy("allow_agent_uninstall"):
+        raise PolicyDenied("agent_uninstall_disabled")
+    rt = _runtime()
+    _ensure_engine_ready()
+    # Remove every container WE created (matched by our own name prefix — the backend never
+    # supplies a container name) and its world volume, then playit, then the agent itself.
+    listed = run_allowed(rt, ["ps", "-a", "--filter", f"name=^{SERVER_PREFIX}",
+                              "--format", "{{.Names}}"], timeout=60)
+    names = [n for n in (listed.stdout or "").split() if n.startswith(SERVER_PREFIX)]
+    for c in names:
+        run_allowed(rt, ["rm", "-f", c], timeout=60)
+        run_allowed(rt, ["volume", "rm", c + "_data"], timeout=60)
     _playit_teardown()
     try:
         _spawn_self_cleanup()
     except Exception as e:  # noqa: BLE001
-        return {"status": "ok", "self_cleanup": f"deferred-failed:{type(e).__name__}"}
-    return {"status": "ok"}
-
-
-def _agent_paths():
-    """Files/dirs the installer created (best-effort; mirrors install.sh/.ps1)."""
-    d = os.path.dirname(os.path.abspath(__file__))
-    state_dir = os.path.dirname(STATE_PATH) or "."
-    return d, state_dir
+        return {"status": "ok", "removed": names, "self_cleanup": f"deferred-failed:{type(e).__name__}"}
+    return {"status": "ok", "removed": names}
 
 
 def _spawn_self_cleanup():
-    """Launch a detached process that removes the service + agent files a few seconds
-    later — long enough for the result POST to land. Detached (new session / transient
-    unit) so stopping our own service doesn't kill it mid-cleanup."""
-    d, state_dir = _agent_paths()
+    """Launch a DETACHED Python helper (this same file, `_cleanup` subcommand) that removes the
+    service/autostart entry + agent files a few seconds later — surviving the agent's own death
+    when its service is stopped. Argv only, no shell (the helper uses argv subprocess + winreg)."""
+    d = os.path.dirname(os.path.abspath(__file__))
+    state_dir = os.path.dirname(STATE_PATH) or "."
+    argv = [sys.executable, os.path.abspath(__file__), "_cleanup", d, state_dir]
     if IS_WINDOWS:
-        # Remove BOTH autostart forms: the HKCU Run-key (current installer) and a Scheduled
-        # Task an OLD installer may have left. schtasks delete is synchronous-safe; the file
-        # delete waits out the lock on the running agent.py, then removes the dir tree.
-        # Also unregister the dedicated WSL distro — one shot removes every container,
-        # volume, and Docker inside it (the whole Linux hosting env), leaving the box clean.
-        ps = (
-            f"Start-Sleep 5; "
-            f"schtasks /delete /tn {SERVICE_NAME} /f 2>$null; "
-            f"Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' "
-            f"-Name '{SERVICE_NAME}' -ErrorAction SilentlyContinue; "
-            f"wsl --terminate {WSL_DISTRO} 2>$null; wsl --unregister {WSL_DISTRO} 2>$null; "
-            f"Remove-Item -Recurse -Force '{d}','{state_dir}' -ErrorAction SilentlyContinue"
-        )
         subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", ps],
+            argv,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "DETACHED_PROCESS", 0),
-        )
-        return
-    # POSIX: disable+stop whichever init backend exists, drop the @reboot cron line, then
-    # remove our files. Each step best-effort. Run via setsid so the service-stop's
-    # process-group/cgroup teardown doesn't take this script with it.
-    script = f"""sleep 5
-systemctl disable --now {SERVICE_NAME} 2>/dev/null; rm -f /etc/systemd/system/{SERVICE_NAME}.service 2>/dev/null; systemctl daemon-reload 2>/dev/null
-systemctl --user disable --now {SERVICE_NAME} 2>/dev/null; rm -f "$HOME/.config/systemd/user/{SERVICE_NAME}.service" 2>/dev/null; systemctl --user daemon-reload 2>/dev/null
-rc-update del {SERVICE_NAME} default 2>/dev/null; rc-service {SERVICE_NAME} stop 2>/dev/null; rm -f /etc/init.d/{SERVICE_NAME} 2>/dev/null
-(crontab -l 2>/dev/null | grep -v {SERVICE_NAME}) | crontab - 2>/dev/null
-rm -rf "{d}" "{state_dir}" 2>/dev/null
-"""
-    # Prefer systemd-run (transient unit in its own cgroup → immune to our service's
-    # cgroup kill); fall back to a new-session sh if it isn't available.
-    if shutil.which("systemd-run"):
-        subprocess.Popen(
-            ["systemd-run", "--collect", "--unit", f"{SERVICE_NAME}-uninstall", "/bin/sh", "-c", script],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     else:
-        subprocess.Popen(
-            ["/bin/sh", "-c", script], start_new_session=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        subprocess.Popen(argv, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _execute(cmd):
-    kind, payload = cmd["kind"], cmd["payload"]
-    if kind == "shell":
-        return "done", _run_shell(payload)
-    if kind == "rcon":
-        return "done", _rcon(payload)
-    if kind == "playit":
-        return "done", _playit(payload)
-    if kind == "uninstall":
-        return "done", _uninstall(payload)
-    return "failed", {"error": f"unknown kind {kind}"}
+def _cleanup_main(install_dir, state_dir):
+    """Detached self-cleanup. Fixed agent commands only (argv / winreg), never a backend string
+    and never a shell. Best-effort + idempotent."""
+    time.sleep(5)
+    if IS_WINDOWS:
+        _run_internal(["schtasks", "/delete", "/tn", SERVICE_NAME, "/f"], timeout=30)
+        try:
+            import winreg  # noqa: PLC0415 — Windows-only, lazy
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                                winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, SERVICE_NAME)
+        except OSError:
+            pass
+        _run_internal(["wsl", "--terminate", WSL_DISTRO], timeout=30)
+        _run_internal(["wsl", "--unregister", WSL_DISTRO], timeout=60)
+    else:
+        for argv in (
+            ["systemctl", "disable", "--now", SERVICE_NAME],
+            ["systemctl", "--user", "disable", "--now", SERVICE_NAME],
+            ["rc-update", "del", SERVICE_NAME, "default"],
+            ["rc-service", SERVICE_NAME, "stop"],
+        ):
+            _run_internal(argv, timeout=30)
+        for path in (f"/etc/systemd/system/{SERVICE_NAME}.service",
+                     os.path.expanduser(f"~/.config/systemd/user/{SERVICE_NAME}.service"),
+                     f"/etc/init.d/{SERVICE_NAME}"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        _run_internal(["systemctl", "daemon-reload"], timeout=30)
+        _drop_reboot_crontab()
+    for d in (install_dir, state_dir):
+        shutil.rmtree(d, ignore_errors=True)
 
+
+def _drop_reboot_crontab():
+    """Remove our @reboot line from the user's crontab without a shell pipe."""
+    cur = _run_internal(["crontab", "-l"], timeout=20)
+    if cur is None or cur.returncode != 0:
+        return
+    kept = [ln for ln in (cur.stdout or "").splitlines() if SERVICE_NAME not in ln]
+    try:
+        subprocess.run(["crontab", "-"], input="\n".join(kept) + "\n", text=True,
+                       capture_output=True, timeout=20, check=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---- action registry (deny-by-default; no dynamic registration from the server) ----
+
+ACTION_REGISTRY = {
+    "agent.health": act_health,
+    "agent.capabilities": act_capabilities,
+    "agent.uninstall": act_uninstall,
+
+    "minecraft.server.create": act_server_create,
+    "minecraft.server.start": _lifecycle("start", "running"),
+    "minecraft.server.stop": _lifecycle("stop", "stopped"),
+    "minecraft.server.restart": _lifecycle("restart", "running"),
+    "minecraft.server.status": act_server_status,
+    "minecraft.server.logs": act_server_logs,
+    "minecraft.server.delete": act_server_delete,
+    "minecraft.server.reconcile_status": act_reconcile_status,
+
+    "minecraft.server.say": act_say,
+    "minecraft.server.save_all": act_save_all,
+    "minecraft.server.console_tail": act_console_tail,
+    "minecraft.server.console_exec": act_console_exec,
+
+    "minecraft.config.set_difficulty": act_set_difficulty,
+    "minecraft.config.set_gamemode": act_set_gamemode,
+
+    "minecraft.player.list": act_player_list,
+    "minecraft.player.whitelist_add": act_whitelist_add,
+    "minecraft.player.whitelist_remove": act_whitelist_remove,
+    "minecraft.player.whitelist_list": act_whitelist_list,
+    "minecraft.player.kick": act_kick,
+
+    "minecraft.backup.create": act_backup_create,
+    "minecraft.backup.list": act_backup_list,
+    "minecraft.backup.delete": act_backup_delete,
+    "minecraft.backup.restore": act_backup_restore,
+
+    "playit.claim_begin": act_playit_claim_begin,
+    "playit.claim_poll": act_playit_claim_poll,
+    "playit.playit_start": act_playit_start,
+    "playit.ensure_tunnel": act_playit_ensure_tunnel,
+    "playit.status": act_playit_status,
+    "playit.remove_tunnel": act_playit_remove_tunnel,
+    "playit.teardown": act_playit_teardown,
+}
+
+
+# ---- protocol v2 envelope: parse, replay/expiry guard, dispatch ----
+
+_REPLAY = {}     # request_id -> (monotonic_ts, result_envelope)
+
+
+def _parse_ts(s):
+    s = (s or "").strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
+
+
+def _result(request_id, action, status, result):
+    return {"request_id": request_id, "status": status, "action": action,
+            "result": result, "agent_policy_version": _policy("policy_version")}
+
+
+def process_command(envelope):
+    """Validate a v2 envelope and run the allowed capability. Returns the result envelope.
+    Deny-by-default at every step; never raises into the caller; never fails OPEN."""
+    if not isinstance(envelope, dict):
+        return _result("", "", "invalid", {"reason": "envelope_not_object"})
+    request_id = envelope.get("request_id") or ""
+    action = envelope.get("action") or ""
+
+    if envelope.get("protocol_version") != PROTOCOL_VERSION:
+        _audit("INVALID", action, request_id, "bad_protocol_version")
+        return _result(request_id, action, "invalid", {"reason": "bad_protocol_version"})
+    params = envelope.get("params")
+    if not isinstance(request_id, str) or not isinstance(action, str) or not isinstance(params, dict):
+        _audit("INVALID", action, request_id, "bad_envelope")
+        return _result(request_id, action, "invalid", {"reason": "bad_envelope"})
+
+    # expiry / clock-skew (spec §17)
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        issued = _parse_ts(envelope["issued_at"])
+        expires = _parse_ts(envelope["expires_at"])
+    except (KeyError, ValueError, TypeError):
+        _audit("INVALID", action, request_id, "bad_timestamps")
+        return _result(request_id, action, "invalid", {"reason": "bad_timestamps"})
+    if now > expires:
+        _audit("DENIED", action, request_id, "expired")
+        return _result(request_id, action, "denied", {"reason": "expired"})
+    if issued > now + datetime.timedelta(seconds=CLOCK_SKEW_SEC):
+        _audit("DENIED", action, request_id, "issued_in_future")
+        return _result(request_id, action, "denied", {"reason": "issued_in_future"})
+
+    # replay protection (spec §17)
+    cutoff = time.monotonic() - REPLAY_WINDOW_SEC
+    for rid in [r for r, (ts, _) in _REPLAY.items() if ts < cutoff]:
+        _REPLAY.pop(rid, None)
+    if request_id in _REPLAY:
+        _audit("DENIED", action, request_id, "replay")
+        return _REPLAY[request_id][1]
+
+    handler = ACTION_REGISTRY.get(action)
+    if handler is None:
+        _audit("DENIED", action, request_id, "unknown_action")
+        return _result(request_id, action, "denied", {"reason": "unknown_action"})
+
+    allowed = set(_policy("allowed_actions") or []) | _ALWAYS_ALLOWED
+    if action not in allowed:
+        _audit("DENIED", action, request_id, "action_disabled_by_policy")
+        return _result(request_id, action, "denied", {"reason": "action_disabled_by_policy"})
+
+    ok, reason = validate_params(action, params)
+    if not ok:
+        _audit("INVALID", action, request_id, reason)
+        return _result(request_id, action, "invalid", {"reason": reason})
+
+    try:
+        data = handler(params)
+        envelope_out = _result(request_id, action, "ok", data)
+        _audit("OK", action, request_id)
+    except (PolicyDenied, SecurityError) as e:
+        envelope_out = _result(request_id, action, "denied", {"reason": str(e)})
+        _audit("DENIED", action, request_id, str(e))
+    except CapabilityError as e:
+        envelope_out = _result(request_id, action, "failed", {"error": str(e)})
+        _audit("FAILED", action, request_id, _bounded(str(e), 120))
+    except Exception as e:  # noqa: BLE001 — a handler bug must not crash the poll loop
+        envelope_out = _result(request_id, action, "failed", {"error": type(e).__name__})
+        _audit("FAILED", action, request_id, type(e).__name__)
+    _REPLAY[request_id] = (time.monotonic(), envelope_out)
+    return envelope_out
+
+
+# ---- CLI subcommands (owner-facing transparency / control) ----
+
+def _cli_audit():
+    path = _audit_path()
+    try:
+        with open(path) as f:
+            lines = f.readlines()[-50:]
+        sys.stdout.write("".join(lines))
+    except OSError:
+        print(f"no audit log yet at {path}")
+
+
+def _cli_policy():
+    print(json.dumps(_load_policy(), indent=2))
+
+
+def _cli_capabilities():
+    print(json.dumps(act_capabilities({}), indent=2))
+
+
+def _cli_wipe_creds():
+    for p in (STATE_PATH, PLAYIT_KEY_PATH):
+        try:
+            os.remove(p)
+            print(f"removed {p}")
+        except OSError:
+            pass
+
+
+def _dispatch_cli(argv):
+    cmd = argv[0]
+    if cmd == "_cleanup" and len(argv) >= 3:
+        _cleanup_main(argv[1], argv[2])
+    elif cmd == "audit":
+        _cli_audit()
+    elif cmd == "policy":
+        _cli_policy()
+    elif cmd == "capabilities":
+        _cli_capabilities()
+    elif cmd == "wipe-creds":
+        _cli_wipe_creds()
+    elif cmd == "approve":
+        # Local-approval store is scaffolded but unused by the default UX (deletes are scoped +
+        # confirmed in the bot). Present so the command exists if an owner enables stricter gating.
+        print("local approval is not required by the current policy")
+    else:
+        print("usage: agent.py [audit|policy|capabilities|wipe-creds|approve <id>]")
+        sys.exit(2)
+
+
+# ---- main poll loop ----
 
 def main():
-    # Startup banner — first thing in the log so a glance answers "what/where/which engine".
+    if len(sys.argv) > 1:
+        _dispatch_cli(sys.argv[1:])
+        return
     _log(f"start: v={USER_AGENT} platform={PLATFORM} runtime={_runtime()} "
-         f"control={CONTROL_URL} state={STATE_PATH} log={LOG_PATH} debug={DEBUG}")
+         f"control={CONTROL_URL} state={STATE_PATH} policy={POLICY_PATH} "
+         f"workspace={_workspace_root()} debug={DEBUG}")
     if not CONTROL_URL:
         _log("CONTROL_URL is required")
         sys.exit(1)
+    if not CONTROL_URL.startswith("https://") and not DEV_MODE:
+        _log("CONTROL_URL must be HTTPS (set MCSPAWN_DEV=1 only for local development)")
+        sys.exit(1)
+    _ensure_workspace()
     state = _load_state()
     secret = state["secret"] if state else _enroll()
     if not secret:
@@ -767,21 +1370,16 @@ def main():
         try:
             status, cmd = _http("GET", "/poll", secret=secret)
             if status == 200 and cmd:
-                st, res = _execute(cmd)
-                _http("POST", "/result", {"id": cmd["id"], "status": st, "result": res}, secret=secret)
-                if cmd.get("kind") == "uninstall":
-                    # We've reported the result and kicked off the detached self-cleanup;
-                    # exit so the (about-to-be-removed) service doesn't relaunch us.
+                envelope = cmd.get("payload") if isinstance(cmd, dict) else None
+                result = process_command(envelope if isinstance(envelope, dict) else {})
+                _http("POST", "/result",
+                      {"id": cmd["id"], "status": "done", "result": result}, secret=secret)
+                if result.get("action") == "agent.uninstall" and result.get("status") == "ok":
                     _log("uninstalled; exiting")
                     sys.exit(0)
             elif status in (200, 204):
-                pass  # no command this cycle
+                pass
             elif status == 401:
-                # The long-lived secret is no longer recognised (e.g. the control
-                # plane's DB was reset). Try one re-enroll: succeeds only if a fresh,
-                # unused TOKEN is present — then we adopt the new secret and carry on.
-                # Otherwise exit so the operator re-pairs, instead of crash-looping
-                # a poll the secret can never satisfy.
                 _log("unauthorized - secret rejected; attempting re-enroll")
                 new_secret = _enroll()
                 if not new_secret:
@@ -789,16 +1387,12 @@ def main():
                     sys.exit(1)
                 secret = new_secret
             else:
-                # 5xx / unexpected status — the control plane is restarting or a
-                # Cloudflare edge blip; back off instead of hammering at backoff=1
-                # (which would spin a tight loop against a 502). Auto-reconnects once
-                # the control plane is healthy again (Phase 6.5).
                 _log(f"poll got HTTP {status}; retry in {backoff}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
             backoff = 1
-        except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+        except (urllib.error.URLError, OSError, ConnectionError) as e:
             _log(f"poll error ({type(e).__name__}); retry in {backoff}s")
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
