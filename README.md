@@ -25,16 +25,19 @@ agent (your box, OUTBOUND only) ──HTTPS──▶ control_api (operator)
    bot) at `CONTROL_URL/enroll` and gets a long-lived secret, saved to
    `/etc/mc-spawn-agent/cred.json` (`chmod 600`).
 2. **Poll** — it long-polls `CONTROL_URL/poll` for commands (Bearer secret).
-3. **Execute locally** —
-   - `shell` — runs a script (the bot provisions Docker + `itzg/minecraft-server`);
-   - `rcon` — speaks Source RCON to `127.0.0.1:<port>` (the server is local, no tunnel);
-   - `playit` — links the user's own playit.gg account (claim flow) and reports the
-     public address friends connect to — no inbound port opened on the box.
-4. **Report** — posts the result back to `CONTROL_URL/result`.
+3. **Validate + execute locally** — each command is a documented **`action + params`** (protocol
+   v2), never a script. The agent parses it, validates the parameters against an exact schema,
+   checks your **local policy**, and only then runs the matching **hardcoded capability** as a
+   fixed `docker` argv (no shell): create/start/stop/restart/status/logs/delete a server, safe
+   semantic RCON (list/say/whitelist/kick/difficulty/gamemode via the container's `rcon-cli`),
+   backups, and linking your own **playit.gg** account for a public play address.
+4. **Report** — posts a structured result envelope back to `CONTROL_URL/result`.
 
-The bot never connects *to* the agent; everything is the agent reaching out. All
-Minecraft logic lives in the bot — the agent is a thin executor (so a Go rewrite is
-a drop-in behind the same HTTP protocol).
+The bot never connects *to* the agent; everything is the agent reaching out. **The backend is
+treated as untrusted — the agent is the security boundary** that decides what is safe to run on
+your box (so a Go rewrite is a drop-in behind the same versioned protocol). See
+[`SECURITY.md`](SECURITY.md), [`THREAT_MODEL.md`](THREAT_MODEL.md), and
+[`docs/PROTOCOL_V2.md`](docs/PROTOCOL_V2.md).
 
 ## Install
 
@@ -184,7 +187,16 @@ Pure, no network: shell executor, command dispatch, RCON soft-error path.
 
 ## Security posture
 
-- **No inbound ports**, NAT-friendly; only outbound HTTPS to `CONTROL_URL`.
-- The long-lived secret is `chmod 600` and never logged.
-- Provisioned servers bind **RCON to `127.0.0.1` only** — never the internet.
-- One file, stdlib only — auditable before you pipe it to `sudo bash`.
+- **The backend is untrusted; the agent is the security boundary.** It can only run a fixed set
+  of documented Minecraft operations (deny-by-default), never arbitrary code. No `shell`/`exec`
+  action exists, and a CI test forbids shell-execution patterns in the source.
+- **Owner-controlled local policy** (`policy.json`): the allowlist of actions, resource limits,
+  and dangerous-action flags. The backend can't change it. Raw console + backup-restore are OFF
+  by default. See [`docs/LOCAL_POLICY.md`](docs/LOCAL_POLICY.md).
+- **Workspace jail** — all files live under `~/.mc-spawn`; no path traversal, no reading your home/
+  SSH keys/etc. Container/volume/tunnel names are agent-derived, so the backend can't target an
+  arbitrary resource ("delete only what it created").
+- **No inbound ports**, NAT-friendly; only outbound HTTPS to `CONTROL_URL` (+ playit if you link
+  it). Replay/expiry-protected; secret `chmod 600`, never logged.
+- **Audit log** of every allow/deny decision (`python3 agent.py audit`).
+- One file, stdlib only — auditable before you run it ([`docs/INSTALL_SAFELY.md`](docs/INSTALL_SAFELY.md)).
