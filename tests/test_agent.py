@@ -1,609 +1,266 @@
-"""Tests for the agent's local executor — pure, deterministic pieces.
+"""Tests for the secure v2 agent — pure, deterministic (no control plane, no Docker).
 
-The full enroll→poll→shell→rcon loop is covered by a live control_api+agent
-end-to-end check (see README); here we keep the fast bits that don't need a
-control plane or a network.
+Focus: the security boundary. Malicious / malformed commands must be DENIED or INVALID, the
+workspace path jail holds, local policy gates the dangerous capabilities, and replay/expiry
+protection works. Capability argv shape is checked with run_allowed mocked (no real engine).
 """
+import datetime
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-# agent.py lives at the repo root.
+# agent.py lives at the repo root; isolate state/policy onto temp paths so tests never read or
+# write a real install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import agent  # noqa: E402
 
 
-class AgentShellTests(unittest.TestCase):
-    def test_run_shell_ok(self):
-        res = agent._run_shell({"script": "echo hi && exit 0"})
-        self.assertEqual(res["exit"], 0)
-        self.assertIn("hi", res["stdout"])
-
-    def test_run_shell_nonzero_exit(self):
-        res = agent._run_shell({"script": "echo oops >&2; exit 3"})
-        self.assertEqual(res["exit"], 3)
-        self.assertIn("oops", res["stderr"])
-
-
-class ShellLoggingTests(unittest.TestCase):
-    """A failing command must log its stderr (so 'Cannot connect to Podman' is visible)
-    but NEVER the script text — the provisioning script carries the RCON password."""
-
-    def test_failure_logs_stderr_not_script(self):
-        logged = []
-        with mock.patch.object(agent, "_log", lambda m: logged.append(m)):
-            agent._run_shell({"script": "echo SECRETPASS >&2; exit 7"})
-        blob = "\n".join(logged)
-        self.assertIn("exit=7", blob)
-        self.assertIn("SECRETPASS", blob)          # stderr tail is shown
-        self.assertNotIn("echo SECRETPASS", blob)   # the script itself is not
-
-    def test_success_is_quiet_without_debug(self):
-        logged = []
-        with mock.patch.object(agent, "DEBUG", False), \
-             mock.patch.object(agent, "_log", lambda m: logged.append(m)):
-            agent._run_shell({"script": "exit 0"})
-        self.assertEqual(logged, [])
+def envelope(action, params, *, request_id="r", issued_delta=0, expires_delta=120):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "protocol_version": 2,
+        "request_id": request_id,
+        "action": action,
+        "params": params,
+        "issued_at": (now + datetime.timedelta(seconds=issued_delta)).isoformat(),
+        "expires_at": (now + datetime.timedelta(seconds=expires_delta)).isoformat(),
+    }
 
 
-class EngineReadyTests(unittest.TestCase):
+def set_policy(**overrides):
+    # Merge over the current cache (set in setUp) so a per-test override doesn't reset the
+    # jailed workspace_root back to the real ~/.mc-spawn default.
+    base = agent._POLICY_CACHE or agent._DEFAULT_POLICY
+    agent._POLICY_CACHE = {**base, **overrides}
+
+
+class _CP:
+    """Stand-in for subprocess.CompletedProcess."""
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class SecurityBase(unittest.TestCase):
     def setUp(self):
-        agent._ENGINE_READY = False
-        agent._RUNTIME_CACHE = None
-        self.addCleanup(lambda: setattr(agent, "_ENGINE_READY", False))
-        self.addCleanup(lambda: setattr(agent, "_RUNTIME_CACHE", None))
-
-    def test_noop_off_windows(self):
-        with mock.patch.object(agent, "IS_WINDOWS", False), \
-             mock.patch.object(agent.subprocess, "run") as run:
-            agent._ensure_engine_ready()
-        run.assert_not_called()
-
-    def test_windows_starts_wsl_distro_docker_once(self):
-        with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.object(agent, "WSL_DISTRO", "mc-spawn"), \
-             mock.patch.object(agent.subprocess, "run") as run:
-            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
-            agent._ensure_engine_ready()
-            agent._ensure_engine_ready()   # cached — must not start twice
-        self.assertEqual(run.call_count, 1)
-        argv = run.call_args[0][0]
-        self.assertEqual(argv[:4], ["wsl", "-d", "mc-spawn", "--"])
-        self.assertIn("service docker start", argv[-1])
-
-
-class ExecuteDispatchTests(unittest.TestCase):
-    def test_unknown_kind(self):
-        status, _res = agent._execute({"kind": "nope", "payload": {}})
-        self.assertEqual(status, "failed")
-
-    def test_playit_dispatch_never_fails_loop(self):
-        # playit always reports "done" with a structured status, so a bad op can't
-        # kill the poll loop.
-        status, res = agent._execute({"kind": "playit", "payload": {"op": "bogus"}})
-        self.assertEqual(status, "done")
-        self.assertEqual(res["status"], "error")
-
-
-class PlayitTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = (agent._playit_secret, agent._playit_api, agent._playit_run)
-        agent._TUNNEL_CREATE_GUARD.clear()  # in-memory create-dedup guard
-
-    def tearDown(self):
-        agent._playit_secret, agent._playit_api, agent._playit_run = self._orig
-        agent._TUNNEL_CREATE_GUARD.clear()
-
-    def test_claim_begin_returns_claim_url(self):
-        agent._playit_secret = lambda: None
-        agent._playit_api = lambda path, body, secret=None: (True, "WaitingForUserVisit")
-        res = agent._playit({"op": "claim_begin"})
-        self.assertEqual(res["status"], "begin")
-        self.assertTrue(res["url"].startswith("https://playit.gg/claim/"))
-        self.assertEqual(len(res["code"]), 10)  # 5 bytes hex
-
-    def test_claim_begin_when_already_linked(self):
-        agent._playit_secret = lambda: "sek"
-        # No address work here anymore — the bot drives the address stage next.
-        self.assertEqual(agent._playit({"op": "claim_begin"})["status"], "linked")
-
-    def test_claim_poll_accepted_saves_secret(self):
-        agent._playit_secret = lambda: None
-
-        def fake_api(path, body, secret=None):
-            if path == "/claim/setup":
-                return True, "UserAccepted"
-            if path == "/claim/exchange":
-                return True, {"secret_key": "newsek"}
-            return False, None
-
-        agent._playit_api = fake_api
-        with mock.patch.object(agent, "_save_playit_secret") as save:
-            res = agent._playit({"op": "claim_poll", "code": "abcdef"})
-        self.assertEqual(res["status"], "accepted")
-        save.assert_called_once_with("newsek")
-
-    def test_claim_poll_waiting_then_rejected(self):
-        agent._playit_secret = lambda: None
-        agent._playit_api = lambda path, body, secret=None: (True, "WaitingForUserVisit")
-        self.assertEqual(agent._playit({"op": "claim_poll", "code": "x"})["status"], "waiting")
-        agent._playit_api = lambda path, body, secret=None: (True, "UserRejected")
-        self.assertEqual(agent._playit({"op": "claim_poll", "code": "x"})["status"], "rejected")
-
-    def test_claim_poll_distinguishes_visit_vs_approve(self):
-        # playit's claim is two site steps; the agent surfaces which one is pending.
-        agent._playit_secret = lambda: None
-        agent._playit_api = lambda p, b, secret=None: (True, "WaitingForUserVisit")
-        r = agent._playit({"op": "claim_poll", "code": "x"})
-        self.assertEqual((r["status"], r["stage"]), ("waiting", "visit"))
-        agent._playit_api = lambda p, b, secret=None: (True, "WaitingForUser")
-        r = agent._playit({"op": "claim_poll", "code": "x"})
-        self.assertEqual((r["status"], r["stage"]), ("waiting", "approve"))
-
-    def test_claim_setup_sends_playit_version_shape(self):
-        # A non-"playit <semver>" version makes /tunnels/create fail AgentVersionTooOld.
-        captured = {}
-
-        def fake_api(path, body, secret=None):
-            captured.update(body)
-            return True, "WaitingForUserVisit"
-
-        agent._playit_secret = lambda: None
-        agent._playit_api = fake_api
-        agent._playit({"op": "claim_poll", "code": "abc"})
-        self.assertTrue(captured["version"].startswith("playit "))
-        self.assertEqual(captured["agent_type"], "self-managed")
-
-    def test_playit_start_only_runs_docker_no_tunnel(self):
-        # playit_start just ensures the container; it must NOT create a tunnel (that's
-        # ensure_tunnel's retryable job).
-        agent._playit_secret = lambda: "sek"
-        ran = {}
-        agent._playit_run = lambda secret: ran.setdefault("ran", True) or True
-        calls = []
-        agent._playit_api = lambda path, body, secret=None: (calls.append(path), (False, None))[1]
-        res = agent._playit({"op": "playit_start", "local_port": 25570})
-        self.assertEqual(res["status"], "ok")
-        self.assertTrue(ran.get("ran"))
-        self.assertNotIn("/tunnels/create", calls)
-
-    def test_ensure_tunnel_creates_when_absent(self):
-        agent._playit_secret = lambda: "sek"
-        calls = []
-
-        def fake_api(path, body, secret=None):
-            calls.append(path)
-            if path == "/v1/agents/rundata":
-                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
-            if path == "/tunnels/create":
-                return True, {"id": "tid"}
-            return False, None
-
-        agent._playit_api = fake_api
-        res = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
-        self.assertEqual(res["status"], "created")
-        self.assertIn("/tunnels/create", calls)
-
-    def test_ensure_tunnel_guards_duplicate_while_rundata_lags(self):
-        # After a create, rundata lags (tunnel not visible yet). A second ensure_tunnel — a
-        # saga relaunch or a 2nd bot replica — must NOT create a duplicate; it returns `created`.
-        agent._playit_secret = lambda: "sek"
-        creates = []
-
-        def fake_api(path, body, secret=None):
-            if path == "/v1/agents/rundata":
-                return True, {"agent_id": "aid", "tunnels": [], "pending": []}  # never shows it
-            if path == "/tunnels/create":
-                creates.append(body)
-                return True, {"id": "tid"}
-            return False, None
-
-        agent._playit_api = fake_api
-        r1 = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
-        r2 = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
-        self.assertEqual(r1["status"], "created")
-        self.assertEqual(r2["status"], "created")
-        self.assertEqual(len(creates), 1)  # exactly one /tunnels/create despite two calls
-
-    def test_remove_tunnel_clears_create_guard(self):
-        # Deleting a tunnel clears the guard so a later ensure re-creates it (not a no-op).
-        agent._playit_secret = lambda: "sek"
-        creates = []
-
-        def fake_api(path, body, secret=None):
-            if path == "/v1/agents/rundata":
-                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
-            if path == "/tunnels/create":
-                creates.append(body)
-                return True, {"id": "tid"}
-            return True, {}  # delete ok
-
-        agent._playit_api = fake_api
-        agent._playit({"op": "ensure_tunnel", "local_port": 25570})   # create #1, guard set
-        agent._playit({"op": "remove_tunnel", "local_port": 25570})   # clears guard
-        agent._playit({"op": "ensure_tunnel", "local_port": 25570})   # must create again
-        self.assertEqual(len(creates), 2)
-
-    def test_ensure_tunnel_idempotent_when_present(self):
-        # If this port already has a tunnel, ensure must NOT create another (no duplicates).
-        agent._playit_secret = lambda: "sek"
-        calls = []
-
-        def fake_api(path, body, secret=None):
-            calls.append(path)
-            if path == "/v1/agents/rundata":
-                return True, {"agent_id": "aid", "pending": [],
-                              "tunnels": [{"name": "mc-spawn-25570", "display_address": "x.ply.gg:1"}]}
-            return False, None
-
-        agent._playit_api = fake_api
-        res = agent._playit({"op": "ensure_tunnel", "local_port": 25570})
-        self.assertEqual(res["status"], "exists")
-        self.assertEqual(res["address"], "x.ply.gg:1")
-        self.assertNotIn("/tunnels/create", calls)
-
-    def test_status_unlinked(self):
-        agent._playit_secret = lambda: None
-        self.assertEqual(agent._playit({"op": "status"})["status"], "unlinked")
-
-    def test_status_reads_this_ports_address_not_the_first(self):
-        agent._playit_secret = lambda: "sek"
-        agent._playit_api = lambda path, body, secret=None: (True, {
-            "agent_id": "a", "pending": [], "tunnels": [
-                {"name": "mc-spawn-25565", "display_address": "a.ply.gg:1"},
-                {"name": "mc-spawn-25566", "display_address": "b.ply.gg:2"},
-            ]})
-        res = agent._playit({"op": "status", "local_port": 25566})
-        self.assertEqual(res["status"], "ok")
-        self.assertEqual(res["address"], "b.ply.gg:2")  # the matching port, not just the first
-
-    def test_status_is_read_only_never_creates(self):
-        # status must NOT create tunnels — otherwise the bot's poll loop spawns duplicates.
-        agent._playit_secret = lambda: "sek"
-        calls = []
-
-        def fake_api(path, body, secret=None):
-            calls.append(path)
-            if path == "/v1/agents/rundata":
-                return True, {"agent_id": "a", "tunnels": [], "pending": []}
-            return False, None
-
-        agent._playit_api = fake_api
-        res = agent._playit({"op": "status", "local_port": 25565})
-        self.assertEqual(res["status"], "no_tunnel")
-        self.assertNotIn("/tunnels/create", calls)  # the bug fix: no creation on status
-
-    def test_ensure_tunnel_hard_error_surfaces(self):
-        # Real create failures (e.g. guest account) surface via ensure_tunnel as an error.
-        agent._playit_secret = lambda: "sek"
-
-        def fake_api(path, body, secret=None):
-            if path == "/v1/agents/rundata":
-                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
-            if path == "/tunnels/create":
-                return False, "RequiresVerifiedAccount"
-            return False, None
-
-        agent._playit_api = fake_api
-        res = agent._playit({"op": "ensure_tunnel", "local_port": 25565})
-        self.assertEqual(res["status"], "error")
-        self.assertIn("RequiresVerifiedAccount", res["error"])
-
-    def test_ensure_tunnel_version_too_old_is_connecting_retryable(self):
-        # While the container is still connecting, create returns AgentVersionTooOld —
-        # ensure_tunnel reports "connecting" (not error) so the bot keeps retrying create.
-        agent._playit_secret = lambda: "sek"
-
-        def fake_api(path, body, secret=None):
-            if path == "/v1/agents/rundata":
-                return True, {"agent_id": "aid", "tunnels": [], "pending": []}
-            if path == "/tunnels/create":
-                return False, "AgentVersionTooOld"
-            return False, None
-
-        agent._playit_api = fake_api
-        self.assertEqual(
-            agent._playit({"op": "ensure_tunnel", "local_port": 25565})["status"], "connecting")
-
-    def test_create_tunnel_named_and_routed_per_port(self):
-        captured = {}
-
-        def fake_api(path, body, secret=None):
-            if path == "/tunnels/create":
-                captured.update(body)
-                return True, {"id": "t"}
-            return False, None
-
-        agent._playit_api = fake_api
-        ok, _ = agent._playit_create_tunnel("sek", "aid", 25570)
-        self.assertTrue(ok)
-        self.assertEqual(captured["name"], "mc-spawn-25570")
-        self.assertEqual(captured["origin"]["data"]["local_port"], 25570)
-
-
-class TeardownTests(unittest.TestCase):
-    def setUp(self):
-        self._orig = (agent._playit_secret, agent._playit_api)
-
-    def tearDown(self):
-        agent._playit_secret, agent._playit_api = self._orig
-
-    def test_delete_tunnels_only_targets_ours(self):
-        deleted = []
-
-        def fake_api(path, body, secret=None):
-            if path == "/v1/agents/rundata":
-                return True, {"tunnels": [
-                    {"name": "mc-spawn", "id": "t1"},
-                    {"name": "user-made-by-hand", "id": "t2"},  # leave the user's own alone
-                ]}
-            if path == "/tunnels/delete":
-                deleted.append(body["tunnel_id"])
-                return True, {}
-            return False, None
-
-        agent._playit_api = fake_api
-        agent._playit_delete_tunnels("sek")
-        self.assertEqual(deleted, ["t1"])
-
-    def test_delete_tunnels_for_one_port_only(self):
-        deleted = []
-
-        def fake_api(path, body, secret=None):
-            if path == "/v1/agents/rundata":
-                return True, {"tunnels": [
-                    {"name": "mc-spawn-25565", "id": "t1"},
-                    {"name": "mc-spawn-25566", "id": "t2"},
-                ]}
-            if path == "/tunnels/delete":
-                deleted.append(body["tunnel_id"])
-                return True, {}
-            return False, None
-
-        agent._playit_api = fake_api
-        agent._playit_delete_tunnels("sek", local_port=25566)
-        self.assertEqual(deleted, ["t2"])  # only the matching port's tunnel
-
-    def test_teardown_is_ok_even_with_no_link(self):
-        agent._playit_secret = lambda: None  # nothing linked
-        with mock.patch.object(agent.subprocess, "run"), \
-                mock.patch.object(agent.os, "remove", side_effect=OSError):
-            res = agent._playit({"op": "teardown"})
-        self.assertEqual(res["status"], "ok")
-
-
-class RconErrorPathTests(unittest.TestCase):
-    def test_rcon_unreachable_is_soft_error(self):
-        # Nothing listening on this loopback port → never raises, returns ok=False.
-        res = agent._rcon({"rcon_port": 1, "password": "x", "command": "list"})
-        self.assertFalse(res["ok"])
-        self.assertIn("RCON", res["text"])
-
-
-class UninstallTests(unittest.TestCase):
-    def test_uninstall_purges_containers_teardowns_playit_and_spawns_cleanup(self):
-        scripts = []
-        with mock.patch.object(agent, "_run_shell",
-                               side_effect=lambda p: scripts.append(p["script"]) or {"exit": 0}), \
-             mock.patch.object(agent, "_playit_teardown") as teardown, \
-             mock.patch.object(agent, "_spawn_self_cleanup") as cleanup:
-            res = agent._uninstall({"containers": ["mcw-1", "mcw-2"]})
-        self.assertEqual(res["status"], "ok")
-        teardown.assert_called_once()
-        cleanup.assert_called_once()
-        blob = "\n".join(scripts)
-        # purge runs through the shell (so it reaches the same engine, incl. WSL on Windows)
-        self.assertIn("rm -f mcw-1", blob)
-        self.assertIn("volume rm mcw-1_data", blob)
-        self.assertIn("rm -f mcw-2", blob)
-        self.assertIn("${MCSPAWN_RT:-docker}", blob)
-
-    def test_execute_dispatches_uninstall(self):
-        with mock.patch.object(agent, "_uninstall", return_value={"status": "ok"}) as u:
-            st, res = agent._execute({"kind": "uninstall", "payload": {"containers": []}})
-        self.assertEqual((st, res["status"]), ("done", "ok"))
-        u.assert_called_once()
-
-    def test_self_cleanup_posix_setsid_script_targets_all_backends(self):
-        popen = []
-        with mock.patch.object(agent, "IS_WINDOWS", False), \
-             mock.patch.object(agent.shutil, "which", return_value=None), \
-             mock.patch.object(agent.subprocess, "Popen",
-                               side_effect=lambda *a, **k: popen.append((a, k))):
-            agent._spawn_self_cleanup()
-        (argv,), kwargs = popen[0]
-        self.assertEqual(argv[0], "/bin/sh")
-        self.assertTrue(kwargs.get("start_new_session"))
-        script = argv[2]
-        for needle in ("systemctl disable --now", "rc-update del", "crontab", "rm -rf"):
-            self.assertIn(needle, script)
-
-    def test_self_cleanup_prefers_systemd_run_when_present(self):
-        popen = []
-        with mock.patch.object(agent, "IS_WINDOWS", False), \
-             mock.patch.object(agent.shutil, "which", return_value="/usr/bin/systemd-run"), \
-             mock.patch.object(agent.subprocess, "Popen",
-                               side_effect=lambda *a, **k: popen.append((a, k))):
-            agent._spawn_self_cleanup()
-        argv = popen[0][0][0]
-        self.assertEqual(argv[0], "systemd-run")
-
-    def test_self_cleanup_windows_uses_schtasks_via_powershell(self):
-        popen = []
-        with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.object(agent.subprocess, "Popen",
-                               side_effect=lambda *a, **k: popen.append((a, k))):
-            agent._spawn_self_cleanup()
-        argv = popen[0][0][0]
-        self.assertEqual(argv[0], "powershell")
-        self.assertIn("schtasks /delete", " ".join(argv))
-
-
-class _Stop(Exception):
-    """Sentinel to break main()'s infinite poll loop in tests (it is not one of the
-    network errors main catches, so it propagates straight out)."""
-
-
-class EnrollTests(unittest.TestCase):
-    def test_enroll_returns_none_without_token(self):
-        with mock.patch.object(agent, "TOKEN", ""):
-            self.assertIsNone(agent._enroll())
-
-    def test_enroll_returns_none_on_http_error(self):
-        with mock.patch.object(agent, "TOKEN", "tok"), \
-             mock.patch.object(agent, "_http", return_value=(401, None)):
-            self.assertIsNone(agent._enroll())
-
-    def test_enroll_saves_and_returns_secret(self):
-        with mock.patch.object(agent, "TOKEN", "tok"), \
-             mock.patch.object(agent, "_http", return_value=(200, {"machine_id": 7, "secret": "s3"})), \
-             mock.patch.object(agent, "_save_state") as save:
-            self.assertEqual(agent._enroll(), "s3")
-            save.assert_called_once_with({"machine_id": 7, "secret": "s3"})
-
-
-class MainReenrollTests(unittest.TestCase):
-    def test_exits_when_no_creds_and_no_token(self):
-        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
-             mock.patch.object(agent, "_load_state", return_value=None), \
-             mock.patch.object(agent, "_enroll", return_value=None):
-            with self.assertRaises(SystemExit):
-                agent.main()
-
-    def test_401_reenrolls_and_continues_with_new_secret(self):
-        polls = []
-
-        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
-            if path == "/poll":
-                polls.append(secret)
-                if len(polls) == 1:
-                    return 401, None      # stale secret rejected
-                raise _Stop               # second poll: end the loop
-            raise AssertionError(f"unexpected call to {path}")
-
-        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
-             mock.patch.object(agent, "_load_state", return_value={"machine_id": 1, "secret": "old"}), \
-             mock.patch.object(agent, "_enroll", return_value="new") as enroll, \
-             mock.patch.object(agent, "_http", side_effect=fake_http):
-            with self.assertRaises(_Stop):
-                agent.main()
-        enroll.assert_called_once()
-        self.assertEqual(polls, ["old", "new"])  # adopted the re-enrolled secret
-
-    def test_5xx_backs_off_instead_of_hammering(self):
-        seq = [503]
-
-        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
-            if path == "/poll":
-                if seq:
-                    return seq.pop(0), None  # control plane restarting
-                raise _Stop                  # end the loop on the retry
-            raise AssertionError(f"unexpected call to {path}")
-
-        slept = []
-        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
-             mock.patch.object(agent, "_load_state", return_value={"machine_id": 1, "secret": "s"}), \
-             mock.patch.object(agent, "_http", side_effect=fake_http), \
-             mock.patch.object(agent.time, "sleep", side_effect=lambda s: slept.append(s)):
-            with self.assertRaises(_Stop):
-                agent.main()
-        self.assertTrue(slept)  # backed off on the 503 rather than spinning
-
-    def test_401_exits_when_reenroll_fails(self):
-        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
-            if path == "/poll":
-                return 401, None
-            raise AssertionError(f"unexpected call to {path}")
-
-        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
-             mock.patch.object(agent, "_load_state", return_value={"machine_id": 1, "secret": "old"}), \
-             mock.patch.object(agent, "_enroll", return_value=None), \
-             mock.patch.object(agent, "_http", side_effect=fake_http):
-            with self.assertRaises(SystemExit):
-                agent.main()
-
-
-class CrossPlatformTests(unittest.TestCase):
-    def test_shell_argv_posix_uses_bash(self):
-        with mock.patch.object(agent, "IS_WINDOWS", False), \
-             mock.patch.dict(agent.os.environ, {}, clear=False):
-            agent.os.environ.pop("AGENT_SHELL", None)
-            self.assertEqual(agent._shell_argv("x"), ["bash", "-c", "x"])
-
-    def test_shell_argv_windows_routes_through_wsl_distro(self):
-        with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.object(agent, "WSL_DISTRO", "mc-spawn"):
-            agent.os.environ.pop("AGENT_SHELL", None)
-            self.assertEqual(
-                agent._shell_argv("x"),
-                ["wsl", "-d", "mc-spawn", "--", "bash", "-lc", "x"])
-
-    def test_runtime_windows_is_docker(self):
-        with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.object(agent, "_RUNTIME_CACHE", None):
-            agent.os.environ.pop("CONTAINER_RUNTIME", None)
-            self.assertEqual(agent._runtime(), "docker")
-        agent._RUNTIME_CACHE = None
-
-    def test_shell_argv_env_override_wins(self):
-        with mock.patch.dict(agent.os.environ, {"AGENT_SHELL": "zsh"}):
-            self.assertEqual(agent._shell_argv("x"), ["zsh", "-c", "x"])
-
-    def test_default_state_path_per_os(self):
-        with mock.patch.object(agent, "IS_WINDOWS", False):
-            self.assertEqual(agent._default_state_path(), "/etc/mc-spawn-agent/cred.json")
-        with mock.patch.object(agent, "IS_WINDOWS", True), \
-             mock.patch.dict(agent.os.environ, {"ProgramData": r"C:\ProgramData"}):
-            self.assertTrue(agent._default_state_path().endswith("cred.json"))
-            self.assertIn("mc-spawn-agent", agent._default_state_path())
-
-    def test_playit_networking_is_host_net_both_os(self):
-        # playit runs inside Linux on both (the WSL distro on Windows), so host-net + loopback.
-        for is_win in (False, True):
-            with mock.patch.object(agent, "IS_WINDOWS", is_win):
-                agent.os.environ.pop("PLAYIT_LOCAL_IP", None)
-                self.assertEqual(agent._playit_local_ip(), "127.0.0.1")
-                self.assertEqual(agent._playit_net_args(), ["--network", "host"])
-
-    def test_playit_local_ip_env_override(self):
-        with mock.patch.dict(agent.os.environ, {"PLAYIT_LOCAL_IP": "10.0.0.5"}):
-            self.assertEqual(agent._playit_local_ip(), "10.0.0.5")
-
-
-class ProtocolNegotiationTests(unittest.TestCase):
-    def test_enroll_sends_protocol_and_platform(self):
-        captured = {}
-
-        def fake_http(method, path, body=None, secret=None, timeout=agent.POLL_TIMEOUT):
-            captured["body"] = body
-            return 200, {"machine_id": 1, "secret": "s"}
-
-        with mock.patch.object(agent, "TOKEN", "tok"), \
-             mock.patch.object(agent, "_http", side_effect=fake_http), \
-             mock.patch.object(agent, "_save_state"):
-            agent._enroll()
-        self.assertEqual(captured["body"]["protocol_version"], agent.PROTOCOL_VERSION)
-        self.assertEqual(captured["body"]["platform"], agent.PLATFORM)
-
-    def test_http_attaches_protocol_and_platform_headers(self):
-        seen = {}
-
-        class FakeResp:
-            status = 200
-            def read(self): return b"{}"
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-
-        def fake_urlopen(req, timeout=None):
-            seen["headers"] = {k.lower(): v for k, v in req.header_items()}
-            return FakeResp()
-
-        with mock.patch.object(agent, "CONTROL_URL", "http://c"), \
-             mock.patch.object(agent.urllib.request, "urlopen", side_effect=fake_urlopen):
-            agent._http("GET", "/poll", secret="s")
-        self.assertEqual(seen["headers"]["x-mc-spawn-protocol"], str(agent.PROTOCOL_VERSION))
-        self.assertEqual(seen["headers"]["x-mc-spawn-platform"], agent.PLATFORM)
+        agent._REPLAY.clear()
+        # Jail the workspace (so the audit log doesn't write to the real ~/.mc-spawn).
+        self._ws = tempfile.TemporaryDirectory()
+        set_policy(workspace_root=self._ws.name)
+        self.addCleanup(self._ws.cleanup)
+        self.addCleanup(lambda: setattr(agent, "_POLICY_CACHE", None))
+        self.addCleanup(agent._REPLAY.clear)
+
+    def run_cmd(self, action, params, **kw):
+        return agent.process_command(envelope(action, params, **kw))
+
+
+class RejectionTests(SecurityBase):
+    """The spec §21.1 malicious-command matrix — all must be denied/invalid."""
+
+    def test_legacy_shell_denied(self):
+        r = self.run_cmd("shell", {"script": "id"})
+        self.assertEqual(r["status"], "denied")
+        self.assertEqual(r["result"]["reason"], "unknown_action")
+
+    def test_unknown_create_field_invalid(self):
+        r = self.run_cmd("minecraft.server.create", {
+            "server_id": "main", "kind": "VANILLA", "version": "1.21", "ram_mb": 2048,
+            "port": 25565, "rcon_port": 25575, "rcon_password": "abcdefgh", "extra": "bad"})
+        self.assertEqual(r["status"], "invalid")
+        self.assertEqual(r["result"]["reason"], "unknown_field:extra")
+
+    def test_server_id_path_traversal_invalid(self):
+        r = self.run_cmd("minecraft.server.logs", {"server_id": "../../..", "lines": 100})
+        self.assertEqual(r["status"], "invalid")
+        self.assertIn("server_id", r["result"]["reason"])
+
+    def test_ram_out_of_range_invalid(self):
+        r = self.run_cmd("minecraft.server.create", {
+            "server_id": "main", "kind": "VANILLA", "version": "1.21", "ram_mb": 999999,
+            "port": 25565, "rcon_port": 25575, "rcon_password": "abcdefgh"})
+        self.assertEqual(r["status"], "invalid")
+        self.assertEqual(r["result"]["reason"], "ram_mb:above_max")
+
+    def test_raw_rcon_action_denied(self):
+        r = self.run_cmd("minecraft.rcon.raw", {"command": "op attacker"})
+        self.assertEqual(r["status"], "denied")
+        self.assertEqual(r["result"]["reason"], "unknown_action")
+
+    def test_update_from_url_denied(self):
+        r = self.run_cmd("agent.update_from_url", {"url": "https://evil.test/a.py"})
+        self.assertEqual(r["status"], "denied")
+
+    def test_missing_required_field_invalid(self):
+        r = self.run_cmd("minecraft.player.whitelist_add", {"server_id": "main"})  # no player
+        self.assertEqual(r["status"], "invalid")
+        self.assertEqual(r["result"]["reason"], "missing:player")
+
+    def test_bad_player_name_invalid(self):
+        r = self.run_cmd("minecraft.player.kick", {"server_id": "main", "player": "a b; rm -rf"})
+        self.assertEqual(r["status"], "invalid")
+
+    def test_bad_protocol_version_invalid(self):
+        e = envelope("agent.health", {})
+        e["protocol_version"] = 1
+        r = agent.process_command(e)
+        self.assertEqual(r["status"], "invalid")
+        self.assertEqual(r["result"]["reason"], "bad_protocol_version")
+
+
+class PolicyTests(SecurityBase):
+    def test_action_disabled_by_policy_denied(self):
+        set_policy(allowed_actions=["agent.health"])  # start not allowed
+        r = self.run_cmd("minecraft.server.start", {"server_id": "main"})
+        self.assertEqual(r["status"], "denied")
+        self.assertEqual(r["result"]["reason"], "action_disabled_by_policy")
+
+    def test_console_exec_denied_by_default(self):
+        r = self.run_cmd("minecraft.server.console_exec", {"server_id": "main", "command": "op x"})
+        self.assertEqual(r["status"], "denied")
+        self.assertEqual(r["result"]["reason"], "raw_console_disabled")
+
+    def test_console_exec_allowed_when_owner_opts_in(self):
+        set_policy(allow_raw_rcon=True)
+        with mock.patch.object(agent, "_rcon_cli", return_value="done"):
+            r = self.run_cmd("minecraft.server.console_exec", {"server_id": "main", "command": "op x"})
+        self.assertEqual(r["status"], "ok")
+
+    def test_delete_denied_when_policy_off(self):
+        set_policy(allow_server_delete=False)
+        r = self.run_cmd("minecraft.server.delete", {"server_id": "main"})
+        self.assertEqual(r["status"], "denied")
+        self.assertEqual(r["result"]["reason"], "server_delete_disabled")
+
+    def test_uninstall_denied_when_policy_off(self):
+        set_policy(allow_agent_uninstall=False)
+        r = self.run_cmd("agent.uninstall", {})
+        self.assertEqual(r["status"], "denied")
+
+    def test_port_outside_range_denied(self):
+        set_policy(allowed_port_range=[25565, 25565])
+        with mock.patch.object(agent, "_ensure_engine_ready"), \
+             mock.patch.object(agent, "run_allowed", return_value=_CP(0)):
+            r = self.run_cmd("minecraft.server.create", {
+                "server_id": "main", "kind": "VANILLA", "version": "1.21", "ram_mb": 1024,
+                "port": 25600, "rcon_port": 25575, "rcon_password": "abcdefgh"})
+        self.assertEqual(r["status"], "denied")
+        self.assertIn("port_not_allowed", r["result"]["reason"])
+
+    def test_capabilities_reflects_policy(self):
+        set_policy(allowed_actions=["minecraft.server.start"], allow_raw_rcon=False)
+        r = self.run_cmd("agent.capabilities", {})
+        self.assertEqual(r["status"], "ok")
+        self.assertIn("minecraft.server.start", r["result"]["allowed_actions"])
+        self.assertIn("agent.health", r["result"]["allowed_actions"])  # always-allowed
+        self.assertFalse(r["result"]["limits"]["allow_raw_rcon"])
+
+
+class ReplayExpiryTests(SecurityBase):
+    def test_expired_denied(self):
+        r = self.run_cmd("agent.health", {}, issued_delta=-600, expires_delta=-540)
+        self.assertEqual(r["status"], "denied")
+        self.assertEqual(r["result"]["reason"], "expired")
+
+    def test_future_denied(self):
+        r = self.run_cmd("agent.health", {}, issued_delta=600, expires_delta=900)
+        self.assertEqual(r["status"], "denied")
+        self.assertEqual(r["result"]["reason"], "issued_in_future")
+
+    def test_replay_returns_cached_result(self):
+        first = self.run_cmd("agent.health", {}, request_id="dup")
+        second = self.run_cmd("agent.health", {}, request_id="dup")
+        self.assertEqual(first, second)  # cached envelope returned, not re-executed
+
+
+class PathJailTests(unittest.TestCase):
+    def test_parent_escape(self):
+        with self.assertRaises(agent.SecurityError):
+            agent.safe_join("/tmp/mcsroot", "..", "etc")
+
+    def test_absolute_escape(self):
+        with self.assertRaises(agent.SecurityError):
+            agent.safe_join("/tmp/mcsroot", "/etc/passwd")
+
+    def test_nested_ok(self):
+        out = agent.safe_join("/tmp/mcsroot", "backups", "main")
+        self.assertTrue(out.endswith("/backups/main"))
+
+    def test_path_separator_in_segment_escape(self):
+        with self.assertRaises(agent.SecurityError):
+            agent.safe_join("/tmp/mcsroot", "../../secret")
+
+
+class CapabilityArgvTests(SecurityBase):
+    """The hardcoded capabilities must build a SAFE fixed argv — RCON on loopback, container
+    name derived from server_id, semantic RCON via `docker exec rcon-cli` (no password)."""
+
+    def _run(self, action, params):
+        self.calls = []
+
+        def fake_run_allowed(rt, args, timeout=600):
+            self.calls.append((rt, args))
+            return _CP(0, stdout="ok")
+
+        with mock.patch.object(agent, "_ensure_engine_ready"), \
+             mock.patch.object(agent, "run_allowed", side_effect=fake_run_allowed):
+            return agent.process_command(envelope(action, params))
+
+    def test_create_argv_binds_rcon_to_loopback_and_derives_name(self):
+        r = self._run("minecraft.server.create", {
+            "server_id": "7", "kind": "PAPER", "version": "1.21", "ram_mb": 2048,
+            "port": 25565, "rcon_port": 25575, "rcon_password": "abcdefgh"})
+        self.assertEqual(r["status"], "ok")
+        run_call = next(a for _rt, a in self.calls if a and a[0] == "run")
+        joined = " ".join(run_call)
+        self.assertIn("--name mcspawn-server-7", joined)              # agent-derived name
+        self.assertIn("127.0.0.1:25575:25575", joined)               # RCON loopback only
+        self.assertIn("EULA=TRUE", joined)
+        self.assertIn("-v mcspawn-server-7_data:/data", joined)       # named world volume
+        self.assertIn("itzg/minecraft-server", run_call)
+
+    def test_whitelist_add_uses_rcon_cli_exec(self):
+        r = self._run("minecraft.player.whitelist_add", {"server_id": "7", "player": "Steve"})
+        self.assertEqual(r["status"], "ok")
+        _rt, args = self.calls[-1]
+        self.assertEqual(args, ["exec", "mcspawn-server-7", "rcon-cli", "whitelist", "add", "Steve"])
+
+    def test_reconcile_status_shape(self):
+        def fake_run_allowed(rt, args, timeout=600):
+            if args[0] == "info":
+                return _CP(0)
+            if args[:2] == ["inspect", "-f"]:
+                name = args[-1]
+                return _CP(0, stdout="running" if name == "mcspawn-server-1" else "missing")
+            return _CP(0)
+
+        with mock.patch.object(agent, "_ensure_engine_ready"), \
+             mock.patch.object(agent, "run_allowed", side_effect=fake_run_allowed):
+            r = agent.process_command(envelope("minecraft.server.reconcile_status",
+                                               {"server_ids": ["1", "2"]}))
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["result"]["engine"], "up")
+        self.assertEqual(r["result"]["servers"], {"1": "running", "2": "missing"})
+
+
+class RunAllowedTests(unittest.TestCase):
+    def test_rejects_disallowed_engine(self):
+        with self.assertRaises(agent.SecurityError):
+            agent.run_allowed("rm", ["-rf", "/"])
+
+    def test_rejects_non_string_argv(self):
+        with self.assertRaises(agent.SecurityError):
+            agent.run_allowed("docker", ["ps", 5])
+
+
+class HealthTests(SecurityBase):
+    def test_health_ok(self):
+        r = self.run_cmd("agent.health", {})
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["result"]["agent_version"], agent.AGENT_VERSION)
 
 
 if __name__ == "__main__":
