@@ -21,13 +21,15 @@ CONTROL_URL="${CONTROL_URL:-}"
 TOKEN="${TOKEN:-}"
 # Where to fetch agent.py from (override for forks / pinned commits).
 AGENT_RAW="${AGENT_RAW:-https://raw.githubusercontent.com/berolog/mc-spawn-quickserverhub/main}"
+DEFAULT_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="${PATH:-$DEFAULT_PATH}"
 
-log()  { printf '[mc-spawn-agent] %s\n' "$*"; }
-warn() { printf '[mc-spawn-agent] WARN: %s\n' "$*" >&2; }
-die()  { printf '[mc-spawn-agent] ERROR: %s\n' "$*" >&2; exit 1; }
+log()  { printf 'level=info event=%s%s\n' "$1" "${2:+ $2}"; }
+warn() { printf 'level=warning event=%s%s\n' "$1" "${2:+ $2}" >&2; }
+die()  { printf 'level=error event=%s%s\n' "$1" "${2:+ $2}" >&2; exit 1; }
 
-[ -n "$CONTROL_URL" ] || die "CONTROL_URL env is required"
-[ -n "$TOKEN" ]       || die "TOKEN env is required"
+[ -n "$CONTROL_URL" ] || die "config_missing" "key=CONTROL_URL"
+[ -n "$TOKEN" ]       || die "config_missing" "key=TOKEN"
 
 # ---- privilege: prefer rootless, escalate only when a package needs it ----
 if [ "$(id -u)" = 0 ]; then
@@ -58,9 +60,9 @@ pkgname() {
 
 _apt_updated=0
 pm_install() {
-  [ -n "$PM" ] || die "no supported package manager found; install $* manually"
-  can_escalate || die "$* missing and no root/sudo to install it; install it manually and re-run"
-  log "installing: $*"
+  [ -n "$PM" ] || die "package_manager_missing" "packages=$*"
+  can_escalate || die "package_install_denied" "packages=$*"
+  log "package_install" "packages=$*"
   case "$PM" in
     apt-get)
       [ "$_apt_updated" = 1 ] || { $SUDO apt-get update -qq; _apt_updated=1; }
@@ -102,16 +104,16 @@ ensure_cmd bash bash
 setup_docker() {
   if command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1 \
      || command -v nerdctl >/dev/null 2>&1; then
-    log "container engine present"
+    log "container_engine_present"
   elif [ -n "$PM" ] && can_escalate; then
     if ! pm_install "$(pkgname docker)"; then
-      warn "distro docker package failed; trying get.docker.com"
-      $SUDO sh -c 'curl -fsSL https://get.docker.com | sh' || warn "docker install failed"
+      warn "docker_package_failed"
+      $SUDO sh -c 'curl -fsSL https://get.docker.com | sh' || warn "docker_install_failed"
     fi
   elif can_escalate; then
-    $SUDO sh -c 'curl -fsSL https://get.docker.com | sh' || warn "docker install failed"
+    $SUDO sh -c 'curl -fsSL https://get.docker.com | sh' || warn "docker_install_failed"
   else
-    warn "docker missing and no root/sudo to install it — provisioning a server will fail until docker is available"
+    warn "docker_missing"
     return 0
   fi
   # Start the daemon and make the invoking user able to reach it without root.
@@ -127,9 +129,9 @@ setup_docker() {
         if $SUDO usermod -aG docker "$INSTALL_USER" 2>/dev/null; then
           if command -v systemctl >/dev/null 2>&1 && getent group docker >/dev/null 2>&1; then
             DOCKER_NEEDS_SYSTEMD_GROUP=1
-            log "added $INSTALL_USER to docker group; systemd will grant it to the agent immediately"
+            log "docker_group_added" "user=$INSTALL_USER mode=systemd"
           else
-            warn "added $INSTALL_USER to the docker group — log out/in (or run 'newgrp docker') for it to take effect"
+            warn "docker_group_added" "user=$INSTALL_USER mode=new_session_required"
           fi
         fi
       fi
@@ -186,10 +188,10 @@ if [ ! -f "$POLICY" ]; then
 }
 EOF
   chmod 0644 "$POLICY"
-  log "wrote default policy: $POLICY (edit it to tighten what the bot may do)"
+  log "policy_written" "path=$POLICY"
 fi
 
-log "fetching agent.py"
+log "agent_fetch" "url=$AGENT_RAW/agent.py"
 fetch "$AGENT_RAW/agent.py" "$DIR/agent.py"
 chmod 0644 "$DIR/agent.py"
 
@@ -202,6 +204,7 @@ export CONTROL_URL="$CONTROL_URL"
 export TOKEN="$TOKEN"
 export AGENT_STATE="$STATE/cred.json"
 export MCSPAWN_DEBUG="${MCSPAWN_DEBUG:-}"
+export PATH="$DEFAULT_PATH"
 # Self-heal (Phase 6.5): if the user deleted agent.py by hand, re-fetch it before
 # launch so the service recovers on its next restart instead of crash-looping.
 if [ ! -f "$DIR/agent.py" ]; then
@@ -226,6 +229,7 @@ After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
+Environment=PATH=$DEFAULT_PATH
 ExecStart=$RUN
 Restart=always
 RestartSec=5
@@ -235,7 +239,7 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now mc-spawn-agent.service
-  log "installed as a systemd system service (systemctl status mc-spawn-agent)"
+  log "service_installed" "manager=systemd scope=system"
 }
 
 install_systemd_system_user() {
@@ -249,6 +253,7 @@ Wants=network-online.target docker.service
 [Service]
 User=$INSTALL_USER
 SupplementaryGroups=docker
+Environment=PATH=$DEFAULT_PATH
 ExecStart=$RUN
 Restart=always
 RestartSec=5
@@ -261,7 +266,7 @@ EOF
   $SUDO chmod 0644 /etc/systemd/system/mc-spawn-agent.service
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable --now mc-spawn-agent.service
-  log "installed as a systemd system service for $INSTALL_USER with docker socket access"
+  log "service_installed" "manager=systemd scope=system user=$INSTALL_USER docker_group=true"
 }
 
 install_systemd_user() {
@@ -274,6 +279,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+Environment=PATH=$DEFAULT_PATH
 ExecStart=$RUN
 Restart=always
 RestartSec=5
@@ -286,12 +292,12 @@ EOF
   # Without lingering a user service dies on logout; needs root to enable.
   if [ -n "$SUDO" ]; then
     $SUDO loginctl enable-linger "$(id -un)" >/dev/null 2>&1 \
-      && log "lingering enabled — agent survives logout" \
-      || warn "could not enable lingering; agent may stop when you log out"
+      && log "linger_enabled" "user=$INSTALL_USER" \
+      || warn "linger_failed" "user=$INSTALL_USER"
   else
-    warn "no root to enable lingering — the agent may stop when you log out (run: loginctl enable-linger $(id -un))"
+    warn "linger_unavailable" "user=$INSTALL_USER"
   fi
-  log "installed as a systemd --user service (systemctl --user status mc-spawn-agent)"
+  log "service_installed" "manager=systemd scope=user"
 }
 
 install_openrc() {
@@ -313,7 +319,7 @@ EOF
   chmod 0755 /etc/init.d/mc-spawn-agent
   rc-update add mc-spawn-agent default
   rc-service mc-spawn-agent restart
-  log "installed as an OpenRC service (rc-service mc-spawn-agent status)"
+  log "service_installed" "manager=openrc"
 }
 
 install_fallback() {
@@ -329,12 +335,12 @@ install_fallback() {
   if command -v crontab >/dev/null 2>&1; then
     cron_line="@reboot $RUN >>$STATE/agent.out 2>&1"
     ( crontab -l 2>/dev/null | grep -vF "$RUN"; echo "$cron_line" ) | crontab - 2>/dev/null \
-      && log "added @reboot crontab entry for restart-on-boot" \
-      || warn "could not install crontab entry — agent won't auto-start after reboot"
+      && log "crontab_installed" \
+      || warn "crontab_failed"
   else
-    warn "no service manager and no crontab — agent runs now but won't auto-start after reboot"
+    warn "autostart_unavailable"
   fi
-  log "running via nohup (log: $STATE/agent.log)"
+  log "service_installed" "manager=nohup log=$STATE/agent.log"
 }
 
 if [ "$ROOT" = 1 ] && command -v systemctl >/dev/null 2>&1; then
@@ -349,14 +355,10 @@ else
   install_fallback
 fi
 
-log "mc-spawn agent installed and started. Управление — в Telegram-боте."
+log "install_complete"
 # Transparency (spec §14): show exactly what was created + what the agent talks to, so the
 # owner can audit and remove it. No inbound ports are opened on this box.
-log "files created:    $DIR/ (agent.py, run.sh)   $STATE/ (cred.json, policy.json, agent.log)"
-log "local policy:     $POLICY   (owner-editable; backend cannot change it)"
-log "workspace:        ~/.mc-spawn/   (servers/worlds, backups, logs, tmp — all jailed here)"
-log "network out only: $CONTROL_URL   and   https://api.playit.gg   (if you link playit)"
-log "audit log:        ~/.mc-spawn/logs/audit.log   (every allow/deny decision)"
-log "agent log:        $STATE/agent.log   (tail -f $STATE/agent.log)"
-log "inspect/control:  python3 $DIR/agent.py policy|capabilities|audit|wipe-creds"
-log "verbose:          re-run the installer with  MCSPAWN_DEBUG=1  prepended"
+log "paths" "install_dir=$DIR state_dir=$STATE policy=$POLICY"
+log "workspace" "path=$HOME/.mc-spawn"
+log "network" "control_url=$CONTROL_URL playit_url=https://api.playit.gg"
+log "logs" "agent=$STATE/agent.log audit=$HOME/.mc-spawn/logs/audit.log"

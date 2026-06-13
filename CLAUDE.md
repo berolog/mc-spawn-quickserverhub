@@ -40,7 +40,9 @@ within local policy — never arbitrary OS commands or files.*
   network endpoints contacted. Linux installer handles the fresh-Docker group-membership gap:
   if the invoking user cannot reach `/var/run/docker.sock` until a new login session, it installs
   a systemd system unit that still runs as that user but with `SupplementaryGroups=docker`, so no
-  server reboot is needed. Pin `AGENT_RAW` to a release tag for reproducibility.
+  server reboot is needed. Installer-generated launchers/units set a known system `PATH` so the
+  agent can find Docker from systemd's sparse environment. Pin `AGENT_RAW` to a release tag for
+  reproducibility.
 - `mc-spawn-agent.service` — reference systemd unit (installers generate the real one).
 - `tests/test_agent.py` — security tests: rejection matrix (shell/unknown-field/traversal/ram/
   raw-rcon/update-url all denied/invalid), policy gating, replay/expiry, path jail, capability
@@ -105,10 +107,12 @@ always `done`; the bot reads `result.status`). Full action table: `docs/PROTOCOL
 11. **Cross-platform, one codebase — Windows hosting in WSL.** Linux runs the engine directly;
     Windows routes engine argv through `wsl -d <distro>` in `run_allowed` (`_ensure_engine_ready`
     starts dockerd argv-only). The engine is set up ONCE by the installer; the agent never
-    installs packages at runtime (a missing engine → structured `failed`, "re-run the installer").
-12. **Audit + transparency.** Every decision is appended to `~/.mc-spawn/logs/audit.log` (action,
-    request_id, OK/DENIED/INVALID/FAILED, reason — never secrets). CLI: `agent.py
-    audit|policy|capabilities|wipe-creds`.
+    installs packages at runtime (a missing engine → structured `failed` with
+    `container_engine_unavailable:<runtime>`).
+12. **Audit + transparency.** Runtime logs and audit decisions use one key-value format
+    (`ts=… level=… event=…`, plus fields), never secrets. Every decision is appended to
+    `~/.mc-spawn/logs/audit.log` (action, request_id, OK/DENIED/INVALID/FAILED, reason).
+    CLI: `agent.py audit|policy|capabilities|wipe-creds`.
 13. **Scoped self-uninstall.** `agent.uninstall` (policy `allow_agent_uninstall`) removes only
     containers matching its own `mcspawn-server-*` prefix + their volumes + playit, then spawns a
     detached Python `_cleanup` (argv/winreg only, no shell) that removes the service/autostart +

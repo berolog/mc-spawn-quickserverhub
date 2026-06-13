@@ -255,6 +255,24 @@ class RunAllowedTests(unittest.TestCase):
         with self.assertRaises(agent.SecurityError):
             agent.run_allowed("docker", ["ps", 5])
 
+    def test_engine_lookup_checks_system_paths(self):
+        def isfile(path):
+            return path == "/usr/bin/docker"
+
+        with mock.patch.object(agent.shutil, "which", return_value=None), \
+             mock.patch.object(agent.os.path, "isfile", side_effect=isfile), \
+             mock.patch.object(agent.os, "access", return_value=True):
+            self.assertEqual(agent._find_executable("docker"), "/usr/bin/docker")
+
+
+class LogFormatTests(unittest.TestCase):
+    def test_key_value_log_line_omits_empty_fields(self):
+        line = agent._log_line("info", "agent_start", {"path": "/tmp/a b", "debug": None})
+        self.assertIn('level="info"', line)
+        self.assertIn('event="agent_start"', line)
+        self.assertIn('path="/tmp/a b"', line)
+        self.assertNotIn("debug=", line)
+
 
 class HealthTests(SecurityBase):
     def test_health_ok(self):

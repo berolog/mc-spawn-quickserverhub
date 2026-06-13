@@ -79,6 +79,19 @@ DEBUG = os.environ.get("MCSPAWN_DEBUG", "").strip().lower() not in ("", "0", "fa
 LOG_PATH = os.environ.get("AGENT_LOG") or os.path.join(
     os.path.dirname(STATE_PATH) or ".", "agent.log")
 _LOG_CAP = 1_000_000
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _quote_log_value(value):
+    return json.dumps(str(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def _log_line(level, event, fields):
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    parts = [f"ts={_quote_log_value(ts)}", f"level={_quote_log_value(level)}",
+             f"event={_quote_log_value(event)}"]
+    parts.extend(f"{k}={_quote_log_value(v)}" for k, v in fields.items() if v is not None)
+    return " ".join(parts)
 
 
 def _log_to_file(path, line):
@@ -90,20 +103,20 @@ def _log_to_file(path, line):
         except OSError:
             pass
         with open(path, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+            f.write(f"{line}\n")
     except Exception:  # noqa: BLE001 — logging must never break the agent
         pass
 
 
-def _log(msg):
-    line = f"[mc-spawn-agent] {msg}"
+def _log(event, level="info", **fields):
+    line = _log_line(level, event, fields)
     print(line, flush=True)
     _log_to_file(LOG_PATH, line)
 
 
-def _debug(msg):
+def _debug(event, **fields):
     if DEBUG:
-        _log(f"[debug] {msg}")
+        _log(event, level="debug", **fields)
 
 
 # ---- local policy (owner-controlled; the backend can NEVER change it) ----
@@ -180,11 +193,11 @@ def _load_policy():
                 if k in _DEFAULT_POLICY:
                     policy[k] = v
         else:
-            _log(f"policy {POLICY_PATH} is not an object; using defaults")
+            _log("policy_invalid", level="warning", path=POLICY_PATH)
     except FileNotFoundError:
-        _debug(f"no policy file at {POLICY_PATH}; using built-in defaults")
+        _debug("policy_missing", path=POLICY_PATH)
     except (OSError, ValueError) as e:
-        _log(f"policy load failed ({type(e).__name__}); using built-in defaults")
+        _log("policy_load_failed", level="warning", path=POLICY_PATH, error=type(e).__name__)
     _POLICY_CACHE = policy
     return policy
 
@@ -204,8 +217,13 @@ def _audit_path():
 
 
 def _audit(decision, action, request_id, reason=""):
-    extra = f" reason={reason}" if reason else ""
-    _log_to_file(_audit_path(), f"{decision} {action} request_id={request_id}{extra}")
+    _log_to_file(_audit_path(), _log_line(
+        "info", "audit", {
+            "decision": decision,
+            "action": action,
+            "request_id": request_id,
+            "reason": reason or None,
+        }))
 
 
 # ---- errors raised by capability handlers (mapped to result statuses by the dispatcher) ----
@@ -261,11 +279,22 @@ def _runtime():
     elif IS_WINDOWS:
         _RUNTIME_CACHE = "docker"
     else:
-        _RUNTIME_CACHE = next((rt for rt in _RUNTIMES if shutil.which(rt)), "docker")
+        _RUNTIME_CACHE = next((rt for rt in _RUNTIMES if _find_executable(rt)), "docker")
     return _RUNTIME_CACHE
 
 
 _RUNTIMES = ("docker", "podman", "nerdctl")
+
+
+def _find_executable(name):
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in DEFAULT_PATH.split(":"):
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 def minimal_env(rt):
@@ -274,6 +303,7 @@ def minimal_env(rt):
     keep = ("PATH", "HOME", "SystemRoot", "windir", "USERPROFILE", "LOCALAPPDATA",
             "APPDATA", "TEMP", "TMP", "DOCKER_HOST", "XDG_RUNTIME_DIR")
     env = {k: os.environ[k] for k in keep if k in os.environ}
+    env["PATH"] = env.get("PATH") or DEFAULT_PATH
     env["MCSPAWN_RT"] = rt
     return env
 
@@ -293,10 +323,10 @@ def _ensure_engine_ready():
     for _ in range(40):
         r = _run_internal(["wsl", "-d", WSL_DISTRO, "--", "docker", "info"], timeout=20)
         if r is not None and r.returncode == 0:
-            _debug(f"wsl '{WSL_DISTRO}' docker ready")
+            _debug("wsl_docker_ready", distro=WSL_DISTRO)
             return
         time.sleep(1)
-    _log(f"wsl distro '{WSL_DISTRO}' docker not ready (re-run the installer to set up WSL hosting)")
+    _log("wsl_docker_not_ready", level="warning", distro=WSL_DISTRO)
 
 
 def _run_internal(argv, timeout=60):
@@ -306,7 +336,7 @@ def _run_internal(argv, timeout=60):
     try:
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     except Exception as e:  # noqa: BLE001
-        _debug(f"internal {argv[:2]} failed: {type(e).__name__}: {e}")
+        _debug("internal_command_failed", command=" ".join(argv[:2]), error=type(e).__name__)
         return None
 
 
@@ -322,7 +352,10 @@ def run_allowed(rt, args, timeout=ENGINE_TIMEOUT):
     if IS_WINDOWS:
         argv = ["wsl", "-d", WSL_DISTRO, "--", rt, *args]
     else:
-        argv = [shutil.which(rt) or rt, *args]
+        exe = _find_executable(rt)
+        if not exe:
+            raise CapabilityError(f"container_engine_unavailable:{rt}")
+        argv = [exe, *args]
     try:
         return subprocess.run(
             argv, cwd=root, env=minimal_env(rt), capture_output=True, text=True,
@@ -331,7 +364,7 @@ def run_allowed(rt, args, timeout=ENGINE_TIMEOUT):
     except subprocess.TimeoutExpired:
         raise CapabilityError("engine command timed out")
     except FileNotFoundError:
-        raise CapabilityError("container engine not available — re-run the installer")
+        raise CapabilityError(f"container_engine_unavailable:{rt}")
 
 
 def _bounded(text, limit=4000):
@@ -378,7 +411,7 @@ def _save_state(state):
 
 def _enroll():
     if not TOKEN:
-        _log("no stored creds and no TOKEN env - cannot enroll")
+        _log("enroll_missing_token", level="error")
         return None
     status, data = _http(
         "POST", "/enroll",
@@ -386,10 +419,10 @@ def _enroll():
         timeout=20,
     )
     if status != 200 or not data:
-        _log(f"enroll failed (HTTP {status})")
+        _log("enroll_failed", level="error", http_status=status)
         return None
     _save_state({"machine_id": data["machine_id"], "secret": data["secret"]})
-    _log(f"enrolled as machine {data['machine_id']}")
+    _log("enroll_ok", machine_id=data["machine_id"])
     return data["secret"]
 
 
@@ -1350,21 +1383,21 @@ def main():
     if len(sys.argv) > 1:
         _dispatch_cli(sys.argv[1:])
         return
-    _log(f"start: v={USER_AGENT} platform={PLATFORM} runtime={_runtime()} "
-         f"control={CONTROL_URL} state={STATE_PATH} policy={POLICY_PATH} "
-         f"workspace={_workspace_root()} debug={DEBUG}")
+    _log("agent_start", version=USER_AGENT, platform=PLATFORM, runtime=_runtime(),
+         control_url=CONTROL_URL, state=STATE_PATH, policy=POLICY_PATH,
+         workspace=_workspace_root())
     if not CONTROL_URL:
-        _log("CONTROL_URL is required")
+        _log("config_missing", level="error", key="CONTROL_URL")
         sys.exit(1)
     if not CONTROL_URL.startswith("https://") and not DEV_MODE:
-        _log("CONTROL_URL must be HTTPS (set MCSPAWN_DEV=1 only for local development)")
+        _log("config_invalid", level="error", key="CONTROL_URL", reason="https_required")
         sys.exit(1)
     _ensure_workspace()
     state = _load_state()
     secret = state["secret"] if state else _enroll()
     if not secret:
         sys.exit(1)
-    _log("running; polling for commands")
+    _log("poll_loop_start")
     backoff = 1
     while True:
         try:
@@ -1375,25 +1408,25 @@ def main():
                 _http("POST", "/result",
                       {"id": cmd["id"], "status": "done", "result": result}, secret=secret)
                 if result.get("action") == "agent.uninstall" and result.get("status") == "ok":
-                    _log("uninstalled; exiting")
+                    _log("agent_uninstalled")
                     sys.exit(0)
             elif status in (200, 204):
                 pass
             elif status == 401:
-                _log("unauthorized - secret rejected; attempting re-enroll")
+                _log("auth_rejected", level="warning")
                 new_secret = _enroll()
                 if not new_secret:
-                    _log("re-enroll failed (need a fresh TOKEN from the bot); stopping")
+                    _log("reenroll_failed", level="error")
                     sys.exit(1)
                 secret = new_secret
             else:
-                _log(f"poll got HTTP {status}; retry in {backoff}s")
+                _log("poll_http_error", level="warning", http_status=status, retry_sec=backoff)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
             backoff = 1
         except (urllib.error.URLError, OSError, ConnectionError) as e:
-            _log(f"poll error ({type(e).__name__}); retry in {backoff}s")
+            _log("poll_transport_error", level="warning", error=type(e).__name__, retry_sec=backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
